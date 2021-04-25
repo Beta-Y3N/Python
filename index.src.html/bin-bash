@@ -1,0 +1,2431 @@
+<pre class='metadata'>
+Title: WebCodecs
+Repository: w3c/webcodecs
+Status: ED
+ED: https://w3c.github.io/webcodecs/
+TR: https://www.w3.org/TR/webcodecs/
+Previous Version: from biblio
+Shortname: webcodecs
+Level: None
+Group: mediawg
+Editor: Chris Cunningham, w3cid 114832, Google Inc. https://www.google.com/
+Editor: Paul Adenot, w3cid 62410, Mozilla https://www.mozilla.org/
+Editor: Bernard Aboba, w3cid 65611, Microsoft Corporation https://www.microsoft.com/
+
+Abstract: This specification defines interfaces to codecs for encoding and
+    decoding of audio and video.
+
+    This specification does not specify or require any particular codec or
+    method of encoding or decoding. The purpose of this specification is to
+    provide JavaScript interfaces to implementations of existing codec
+    technology developed elsewhere. Implementers may support any combination of
+    codecs or none at all.
+
+Markup Shorthands:css no, markdown yes, dfn yes
+!Participate: <a href="https://github.com/w3c/webcodecs">Git Repository.</a>
+!Participate: <a href="https://github.com/w3c/webcodecs/issues/new">File an issue.</a>
+!Version History: <a href="https://github.com/w3c/webcodecs/commits">https://github.com/w3c/webcodecs/commits</a>
+</pre>
+
+<pre class='anchors'>
+spec: media-source; urlPrefix: https://www.w3.org/TR/media-source/
+    type: method
+        for: MediaSource; text: isTypeSupported(); url: #dom-mediasource-istypesupported
+
+spec: html; urlPrefix: https://html.spec.whatwg.org/multipage/;
+    for: HTMLMediaElement;
+        type: method; text: canPlayType(); url: #dom-navigator-canplaytype
+    for: PlatformObject;
+        type: attribute; text: [[Detached]]; url: structured-data.html#detached
+    for: ImageBitmap;
+        type: attribute; text: resizeWidth; url:#dom-imagebitmapoptions-resizewidth
+        type: attribute; text: resizeHeight; url:#dom-imagebitmapoptions-resizeheight
+    type: dfn; text: global object; url: webappapis.html#global-object
+
+spec: mediacapture-streams; urlPrefix: https://www.w3.org/TR/mediacapture-streams/
+    for: mediaDevices;
+        type: method; text: getUserMedia(); url: #dom-mediadevices-getusermedia
+
+spec: mediacapture-screen-share; urlPrefix: https://w3c.github.io/mediacapture-screen-share/
+    for: mediaDevices; type: method; text: getDisplayMedia(); url: #dom-mediadevices-getdisplaymedia
+
+spec: mediacapture-main; urlPrefix: https://w3c.github.io/mediacapture-main/
+    for:MediaStreamTrackState;
+        type: enum-value; text: live; url: #idl-def-MediaStreamTrackState.live
+        type: enum-value; text: ended; url: #idl-def-MediaStreamTrackState.ended
+
+spec: mimesniff; urlPrefix: https://mimesniff.spec.whatwg.org/#
+    type: dfn; text: MIME type; url: mime-type
+
+spec: infra; urlPrefix: https://infra.spec.whatwg.org/#
+    type: dfn; text: queue; url: queues
+    type: dfn; text: enqueing; url: queue-enqueue;
+    type: dfn; text: dequeued; url: queue-dequeue;
+    type: dfn; text: empty; url: list-is-empty;
+    type: dfn; text: list; url: lists;
+
+spec: mediastream-recording; urlPrefix: https://www.w3.org/TR/mediastream-recording/#
+    type: interface; text: MediaRecorder; url: mediarecorder
+
+spec: media-capabilities; urlPrefix: https://w3c.github.io/media-capabilities/#
+    type: method; text: decodingInfo(); url: dom-mediacapabilities-decodinginfo
+    type: attribute; text: powerEfficient; url: dom-mediacapabilitiesinfo-powerefficient
+</pre>
+
+
+Definitions {#definitions}
+==========================
+
+: <dfn>Codec</dfn>
+:: Refers generically to an instance of AudioDecoder, AudioEncoder,
+    VideoDecoder, or VideoEncoder.
+
+: Key Frame
+:: An encoded frame that does not depend on any other frames for decoding.
+
+: <dfn>Internal Pending Output</dfn>
+:: Codec outputs such as {{VideoFrame}}s that currently reside in the internal
+    pipeline of the underlying codec implementation. The underlying codec
+    implementation may emit new outputs only when a new inputs are provided. The
+    underlying codec implementation must emit all outputs in response to a
+    flush.
+
+: <dfn lt="system resources">Codec System Resources</dfn>
+:: Resources including CPU memory, GPU memory, and exclusive handles to specific
+    decoding/encoding hardware that may be allocated by the User Agent as part
+    of codec configuration or generation of {{AudioFrame}} and {{VideoFrame}}
+    objects. Such resources may be quickly exhuasted and should be released
+    immediately when no longer in use.
+
+Codec Processing Model {#codec-processing-model}
+================================================
+
+Background {#processing-model-background}
+-----------------------------------------
+
+This section is non-normative.
+
+The codec interfaces defined by the specification are designed such that new
+codec tasks may be scheduled while previous tasks are still pending. For
+example, web authors may call `decode()` without waiting for a previous
+`decode()` to complete. This is achieved by offloading underlying codec tasks to
+a separate thread for parallel execution.
+
+This section describes threading behaviors as they are visible from the
+perspective of web authors. Implementers may choose to use more or less threads
+as long the exernally visible behaviors of blocking and sequencing are
+maintained as follows.
+
+Control Thread and Codec Thread {#control-thread-and-codec-thread}
+------------------------------------------------------------------
+
+All steps in this specificaiton will run on either a [=control thread=] or
+a [=codec thread=].
+
+The <dfn>control thread</dfn> is the thread from which authors will construct
+a [=codec=] and invoke its methods. Invoking a codec's methods will typically
+result in the creation of [=control messages=] which are later executed on the
+[=codec thread=]. Each [=global object=] has a separate control thread.
+
+The <dfn>codec thread</dfn> is the thread from which a [=codec=] will
+[=dequeue=] [=control messages=] and execute their steps. Each [=codec=]
+instance has a separate codec thread. The lifetime of a codec thread matches
+that of its associated [=codec=] instance.
+
+The [=control thread=] uses a traditional event loop, as described in [[!HTML]].
+
+The [=codec thread=] uses a specialized [=codec processing loop=].
+
+Communication from the [=control thread=] to the [=codec thread=] is done using
+[=control message=] passing. Communication in the other direction is done using
+regular event loop tasks.
+
+Each [=codec=] instance has a single <dfn>control message queue</dfn> that is
+a [=queue=] of <dfn>control messages</dfn>.
+
+<dfn lt="Enqueues a control message|Queue a control message">Queuing a control
+message</dfn> means [=enqueing=] the message to a [=codec=]’s [=control
+message queue=]. Invoking codec methods will often queue a control message
+to schedule work.
+
+<dfn lt="running a control message|control message steps">Running a control
+message</dfn> means performing a sequence of steps specified by the method
+that enqueued the message. The steps of a control message may depend on
+<dfn>injected state</dfn>, supplied by the method that enqueued the message.
+
+<dfn lt="Reset the control message queue">Resetting the control message
+    queue</dfn> means performing these steps:
+1. For each [=control message=] in the [=control message queue=]:
+    1. If a control message's [=injected state=] includes a promise, reject
+        that promise.
+    2. Remove the message from the queue.
+
+The <dfn>codec processing loop</dfn> must run these steps:
+1. While true:
+    1. If the [=control message queue=] is emtpy, [=continue=].
+    2. Dequeue |front message| from the [=control message queue=].
+    3. Run [=control message steps=] described by |front message|.
+
+AudioDecoder Interface {#audiodecoder-interface}
+================================================
+
+<xmp class='idl'>
+[Exposed=(Window,DedicatedWorker)]
+interface AudioDecoder {
+  constructor(AudioDecoderInit init);
+
+  readonly attribute CodecState state;
+  readonly attribute long decodeQueueSize;
+
+  undefined configure(AudioDecoderConfig config);
+  undefined decode(EncodedAudioChunk chunk);
+  Promise<undefined> flush();
+  undefined reset();
+  undefined close();
+
+  static Promise<AudioDecoderSupport> isConfigSupported(AudioDecoderConfig config);
+};
+
+dictionary AudioDecoderInit {
+  required AudioFrameOutputCallback output;
+  required WebCodecsErrorCallback error;
+};
+
+callback AudioFrameOutputCallback = undefined(AudioFrame output);
+</xmp>
+
+Internal Slots {#audiodecoder-internal-slots}
+---------------------------------------------
+<dl>
+<dt><dfn attribute for=AudioDecoder>[[codec implementation]]</dfn></dt>
+<dd>Underlying decoder implementation provided by the User Agent.</dd>
+<dt><dfn attribute for=AudioDecoder>[[output callback]]</dfn></dt>
+<dd>Callback given at construction for decoded outputs.</dd>
+<dt><dfn attribute for=AudioDecoder>[[error callback]]</dfn></dt>
+<dd>Callback given at construction for decode errors.</dd>
+</dl>
+
+Constructors {#audiodecoder-constructors}
+-----------------------------------------
+<dfn constructor for=AudioDecoder title="AudioDecoder(init)">
+  AudioDecoder(init)
+</dfn>
+1. Let d be a new {{AudioDecoder}} object.
+2. Assign init.output to the {{AudioDecoder/[[output callback]]}} internal slot.
+3. Assign init.error to the {{AudioDecoder/[[error callback]]}} internal slot.
+4. Assign "unconfigured" to d.state.
+4. Return d.
+
+Attributes {#audiodecoder-attributes}
+-------------------------------------
+<dl>
+  <dt>
+    <dfn attribute for=AudioDecoder>state</dfn>
+  </dt>
+  <dd>Describes the current state of the codec.</dd>
+  <dt>
+    <dfn attribute for=AudioDecoder>decodeQueueSize</dfn>
+  </dt>
+  <dd>
+    The number of pending decode requests. This number will decrease as the
+    underlying codec is ready to accept new input.
+  </dd>
+</dl>
+
+Methods {#audiodecoder-methods}
+-------------------------------
+<dl>
+  <dt><dfn method for=AudioDecoder>configure(config)</dfn></dt>
+  <dd>
+    [=Enqueues a control message=] to configure the audio decoder for decoding
+    chunks as described by |config|.
+
+    NOTE: This method will trigger a {{NotSupportedError}} if the user agent
+        does not support |config|. Authors should first check support by calling
+        {{AudioDecoder/isConfigSupported()}} with |config|. User agents are not
+        required to support any particular codec type or configuration.
+
+    When invoked, run these steps:
+    1. If |config| is not a [=valid AudioDecoderConfig=], throw a
+        {{TypeError}}.
+    2. If {{AudioDecoder/state}} is `“closed”`, throw an {{InvalidStateError}}.
+    3. Set {{AudioDecoder/state}} to `"configured"`.
+    4. [=Queue a control message=] to configure the decoder with |config|.
+
+    [=Running a control message=] to configure the decoder means running
+    these steps:
+    1. Let |supported| be the result of running the <a>Check Configuration
+        Support</a> algorith with |config|.
+    2. If |supported| is `true`, assign
+        {{AudioDecoder/[[codec implementation]]}} with an implementation
+        supporting |config|.
+    3. Otherwise, run the <a>Close AudioDecoder</a> algorithm with
+        {{NotSupportedError}}.
+  </dd>
+
+  <dt><dfn method for=AudioDecoder>decode(chunk)</dfn></dt>
+  <dd>
+    [=Enqueues a control message=] to decode the given |chunk|.
+
+    When invoked, run these steps:
+    1. If {{VideoDecoder/state}} is not `"configured"`, throw an
+        {{InvalidStateError}}.
+    2. Increment {{VideoDecoder/decodeQueueSize}}.
+    3. [=Queue a control message=] to decode the |chunk|.
+
+    Running a control message to decode the chunk means performing these steps:
+    1. Attempt to use {{VideoDecoder/[[codec implementation]]}} to decode the
+        chunk.
+    2. If decoding results in an error, queue a task on the [=control thread=]
+        event loop to run the [=Close VideoDecoder=] algorithm with
+        {{EncodingError}}.
+    3. Queue a task on the [=control thread=] event loop to decrement
+        {{VideoDecoder/decodeQueueSize}}
+    4. Let |decoded outputs| be a [=list=] of decoded video data outputs emitted
+        by {{VideoDecoder/[[codec implementation]]}}.
+    5. If |decoded outputs| is not empty, queue a task on the [=control thread=]
+        event loop to run the [=Output VideoFrames=] algorithm with
+        |decoded outputs|.
+  </dd>
+
+  <dt><dfn method for=AudioDecoder>flush()</dfn></dt>
+  <dd>
+    Completes all [=control messages=] in the [=control message queue=]
+    and emits all outputs.
+
+    When invoked, run these steps:
+    1. If {{AudioDecoder/state}} is not `"configured"`, return
+        [=a promise rejected with=] {{InvalidStateError}} {{DOMException}}.
+    2. Let |promise| be a new Promise.
+    3. [=Queue a control message=] to flush the codec with |promise|.
+    4. Return |promise|.
+
+    Running a control message to flush the codec means performing these steps
+        with |promise|.
+    1. Signal {{AudioDecoder/[[codec implementation]]}} to emit all [=internal
+        pending outputs=].
+    2. Let |decoded outputs| be a [=list=] of decoded audio data outputs emitted
+        by {{AudioDecoder/[[codec implementation]]}}.
+    3. If |decoded outputs| is not empty, queue a task on the [=control thread=]
+        event loop to run the [=Output AudioFrames=] algorithm with
+        |decoded outputs|.
+    4. Queue a task on the [=control thread=] event loop to resolve |promise|.
+  </dd>
+
+  <dt><dfn method for=AudioDecoder>reset()</dfn></dt>
+  <dd>
+    Immediately resets all state including configuration,
+    [=control messages=] in the [=control message queue=], and all pending
+    callbacks.
+
+    When invoked, run the [=Reset AudioDecoder=] algorithm.
+  </dd>
+
+  <dt><dfn method for=AudioDecoder>close()</df></dt>
+  <dd>
+    Immediately aborts all pending work and releases [=system resources=].
+    Close is final.
+
+    When invoked, run the [=Close AudioDecoder=] algorithm.
+  </dd>
+
+  <dt><dfn method for=AudioDecoder>isConfigSupported(config)</dfn></dt>
+  <dd>
+    Returns a promise indicating whether the provided |config| is supported by
+    the user agent.
+
+    NOTE: The returned {{AudioDecoderSupport}} {{AudioDecoderSupport/config}}
+        will contain only the dictionary members that user agent recognized.
+        Unrecognized dictionary memebers will be ignored. Authors may detect
+        unrecognized dictionary members by comparinging
+        {{AudioDecoderSupport/config}} to their provided |config|.
+
+    When invoked, run these steps:
+    1. If |config| is not a <a>valid AudioDecoderConfig</a>, return
+        [=a promise rejected with=] {{TypeError}}.
+    2. Let |p| be a new Promise.
+    3. Let |checkSupportQueue| be the result of starting a new <a>parallel
+        queue</a>.
+    4. Enqueue the following steps to |checkSupportQueue|:
+        1. Let |decoderSupport| be a newly constructed
+            {{AudioDecoderSupport}}, initialized as follows:
+            1. Set {{AudioDecoderSupport/config}} to the result of running the
+                <a>Clone Configuration</a> algorithm with |config|.
+            2. Set {{AudioDecoderSupport/supported}} to the result of running
+                the <a>Check Configuration Support</a> algorithm with |config|.
+        2. Resolve |p| with |decoderSupport|.
+    5. Return  |p|.
+  </dd>
+</dl>
+
+Algorithms {#audiodecoder-algorithms}
+-------------------------------------
+<dl>
+  <dt><dfn>Output AudioFrames</dfn> (with |outputs|)</dt>
+  <dd>
+    Run these steps:
+    1. For each |output| in |outputs|:
+        1. Let |buffer| be an {{AudioBuffer}} containing the decoded audio data in
+            |output|.
+        2. Let |frame| be an {{AudioFrame}} containing |buffer| and a timestamp for
+            the output.
+        3. Invoke {{AudioDecoder/[[output callback]]}} with frame.
+  </dd>
+  <dt><dfn>Reset AudioDecoder</dfn></dt>
+  <dd>
+    Run these steps:
+    1. If {{AudioDecoder/state}} is `"closed"`, throw an {{InvalidStateError}}.
+    2. Set {{AudioDecoder/state}} to `"unconfigured"`.
+    3. Signal {{AudioDecoder/[[codec implementation]]}} to cease producing
+        output for the previous configuration.
+    4. [=Reset the control message queue=].
+    5. Set {{AudioDecoder/decodeQueueSize}} to zero.
+  </dd>
+  <dt><dfn>Close AudioDecoder</dfn> (with error)</dt>
+  <dd>
+    Run these steps:
+    1. Run the [=Reset AudioDecoder=] algorithm.
+    2. Set {{AudioDecoder/state}} to `"closed"`.
+    3. Clear {{AudioDecoder/[[codec implementation]]}} and release associated
+        [=system resources=].
+    4. If |error| is set, queue a task on the [=control thread=] event loop to
+        invoke the {{AudioDecoder/[[error callback]]}} with |error|.
+  </dd>
+</dl>
+
+VideoDecoder Interface {#videodecoder-interface}
+================================================
+
+<xmp class='idl'>
+[Exposed=(Window,DedicatedWorker)]
+interface VideoDecoder {
+  constructor(VideoDecoderInit init);
+
+  readonly attribute CodecState state;
+  readonly attribute long decodeQueueSize;
+
+  undefined configure(VideoDecoderConfig config);
+  undefined decode(EncodedVideoChunk chunk);
+  Promise<undefined> flush();
+  undefined reset();
+  undefined close();
+
+  static Promise<VideoDecoderSupport> isConfigSupported(VideoDecoderConfig config);
+};
+
+dictionary VideoDecoderInit {
+  required VideoFrameOutputCallback output;
+  required WebCodecsErrorCallback error;
+};
+
+callback VideoFrameOutputCallback = undefined(VideoFrame output);
+</xmp>
+
+Internal Slots {#videodecoder-internal-slots}
+---------------------------------------------
+<dl>
+<dt><dfn attribute for=VideoDecoder>[[codec implementation]]</dfn></dt>
+<dd>Underlying decoder implementation provided by the User Agent.</dd>
+<dt><dfn attribute for=VideoDecoder>[[output callback]]</dfn></dt>
+<dd>Callback given at construction for decoded outputs.</dd>
+<dt><dfn attribute for=VideoDecoder>[[error callback]]</dfn></dt>
+<dd>Callback given at construction for decode errors.</dd>
+</dl>
+
+Constructors {#videodecoder-constructors}
+-----------------------------------------
+<dfn constructor for=VideoDecoder title="VideoDecoder(init)">
+  VideoDecoder(init)
+</dfn>
+1. Let d be a new VideoDecoder object.
+2. Assign `init.output` to the {{VideoDecoder/[[output callback]]}} internal slot.
+3. Assign `init.error` to the {{VideoDecoder/[[error callback]]}} internal slot.
+4. Assign "unconfigured" to `d.state`.
+5. Return d.
+
+Attributes {#videodecoder-attributes}
+-------------------------------------
+<dl>
+  <dt>
+    <dfn attribute for=VideoDecoder>state</dfn>
+  </dt>
+  <dd>Describes the current state of the codec.</dd>
+  <dt>
+    <dfn attribute for=VideoDecoder>decodeQueueSize</dfn>
+  </dt>
+  <dd>
+    The number of pending decode requests. This number will decrease as the
+    underlying codec is ready to accept new input.
+  </dd>
+</dl>
+
+Methods {#videodecoder-methods}
+-------------------------------
+<dl>
+  <dt><dfn method for=VideoDecoder>configure(config)</dfn></dt>
+  <dd>
+    [=Enqueues a control message=] to configure the video decoder for decoding
+    chunks as described by |config|.
+
+    NOTE: This method will trigger a {{NotSupportedError}} if the user agent
+        does not support |config|. Authors should first check support by calling
+        {{VideoDecoder/isConfigSupported()}} with |config|. User agents are not
+        required to support any particular codec type or configuration.
+
+    When invoked, run these steps:
+    1. If |config| is not a [=valid VideoDecoderConfig=], throw a
+        {{TypeError}}.
+    2. If {{VideoDecoder/state}} is `“closed”`, throw an {{InvalidStateError}}.
+    3. Set {{VideoDecoder/state}} to `"configured"`.
+    4. [=Queue a control message=] to configure the decoder with |config|.
+
+    [=Running a control message=] to configure the decoder means running
+    these steps:
+    1. Let |supported| be the result of running the <a>Check Configuration
+        Support</a> algorith with |config|.
+    2. If |supported| is `true`, assign
+        {{VideoDecoder/[[codec implementation]]}} with an implementation
+        supporting |config|.
+    3. Otherwise, run the <a>Close VideoDecoder</a> algorithm with
+        {{NotSupportedError}}.
+  </dd>
+
+  <dt><dfn method for=VideoDecoder>decode(chunk)</dfn></dt>
+  <dd>
+    [=Enqueues a control message=] to decode the given |chunk|.
+
+    When invoked, run these steps:
+    1. If {{VideoDecoder/state}} is not `"configured"`, throw an
+        {{InvalidStateError}}.
+    2. Increment {{VideoDecoder/decodeQueueSize}}.
+    3. [=Queue a control message=] to decode the |chunk|.
+
+    Running a control message to decode the chunk means performing these steps:
+    1. Attempt to use {{VideoDecoder/[[codec implementation]]}} to decode the
+        chunk.
+    2. If decoding results in an error, queue a task on the [=control thread=]
+        event loop to run the [=Close VideoDecoder=] algorithm with
+        {{EncodingError}}.
+    3. Queue a task on the [=control thread=] event loop to decrement
+        {{VideoDecoder/decodeQueueSize}}
+    4. Let |decoded outputs| be a [=list=] of decoded video data outputs emitted
+        by {{VideoDecoder/[[codec implementation]]}}.
+    5. If |decoded outputs| is not empty, queue a task on the [=control thread=]
+        event loop to run the [=Output VideoFrames=] algorithm with
+        |decoded outputs|.
+  </dd>
+
+  <dt><dfn method for=VideoDecoder>flush()</dfn></dt>
+  <dd>
+    Completes all [=control messages=] in the [=control message queue=]
+    and emits all outputs.
+
+    When invoked, run these steps:
+    1. If {{VideoDecoder/state}} is not `"configured"`, return
+        [=a promise rejected with=] {{InvalidStateError}} {{DOMException}}.
+    2. Let |promise| be a new Promise.
+    3. [=Queue a control message=] to flush the codec with |promise|.
+    4. Return |promise|.
+
+    Running a control message to flush the codec means performing these steps
+        with |promise|.
+    1. Signal {{VideoDecoder/[[codec implementation]]}} to emit all [=internal
+        pending outputs=].
+    2. Let |decoded outputs| be a [=list=] of decoded video data outputs emitted
+        by {{VideoDecoder/[[codec implementation]]}}.
+    3. If |decoded outputs| is not empty, queue a task on the [=control thread=]
+        event loop to run the [=Output VideoFrames=] algorithm with
+        |decoded outputs|.
+    4. Queue a task on the [=control thread=] event loop to resolve |promise|.
+  </dd>
+
+  <dt><dfn method for=VideoDecoder>reset()</dfn></dt>
+  <dd>
+    Immediately resets all state including configuration,
+    [=control messages=] in the [=control message queue=], and all pending
+    callbacks.
+
+    When invoked, run the [=Reset VideoDecoder=] algorithm.
+  </dd>
+
+  <dt><dfn method for=VideoDecoder>close()</df></dt>
+  <dd>
+    Immediately aborts all pending work and releases [=system resources=].
+    Close is final.
+
+    When invoked, run the [=Close VideoDecoder=] algorithm.
+  </dd>
+
+  <dt><dfn method for=VideoDecoder>isConfigSupported(config)</dfn></dt>
+  <dd>
+    Returns a promise indicating whether the provided |config| is supported by
+    the user agent.
+
+    NOTE: The returned {{VideoDecoderSupport}} {{VideoDecoderSupport/config}}
+        will contain only the dictionary members that user agent recognized.
+        Unrecognized dictionary memebers will be ignored. Authors may detect
+        unrecognized dictionary members by comparinging
+        {{VideoDecoderSupport/config}} to their provided |config|.
+
+    When invoked, run these steps:
+    1. If |config| is not a <a>valid VideoDecoderConfig</a>, return
+        [=a promise rejected with=] {{TypeError}}.
+    2. Let |p| be a new Promise.
+    3. Let |checkSupportQueue| be the result of starting a new <a>parallel
+        queue</a>.
+    4. Enqueue the following steps to |checkSupportQueue|:
+        1. Let |decoderSupport| be a newly constructed
+            {{VideoDecoderSupport}}, initialized as follows:
+            1. Set {{VideoDecoderSupport/config}} to the result of running the
+                <a>Clone Configuration</a> algorithm with |config|.
+            2. Set {{VideoDecoderSupport/supported}} to the result of running
+                the <a>Check Configuration Support</a> algorithm with |config|.
+        2. Resolve |p| with |decoderSupport|.
+    5. Return  |p|.
+  </dd>
+</dl>
+
+Algorithms {#videodecoder-algorithms}
+-------------------------------------
+<dl>
+  <dt><dfn>Output VideoFrames</dfn> (with |outputs|)</dt>
+  <dd>
+    Run these steps:
+    1. For each |output| in |outputs|:
+        1. Let |planes| be a sequence of {{Plane}}s containing the decoded video
+            frame data from |output|.
+        2. Let |pixelFormat| be the {{PixelFormat}} of |planes|.
+        3. Let |frameInit| be a {{VideoFrameInit}} with the following keys:
+            1. Let {{VideoFrameInit/timestamp}} and {{VideoFrameInit/duration}}
+                be the {{EncodedVideoChunk/timestamp}} and
+                {{EncodedVideoChunk/duration}} from the {{EncodedVideoChunk}}
+                associated with |output|.
+            2. Let {{VideoFrameInit/codedWidth}} and
+                {{VideoFrameInit/codedHeight}}
+                be the width and height of the decoded video frame |output| in
+                pixels, prior to any cropping or aspect ratio adjustments.
+            3. Let {{VideoFrameInit/cropLeft}}, {{VideoFrameInit/cropTop}},
+                {{VideoFrameInit/cropWidth}}, and {{VideoFrameInit/cropHeight}}
+                be the crop region of the decoded video frame |output| in
+                pixels, prior to any aspect ratio adjustments.
+            4. Let {{VideoFrameInit/displayWidth}} and
+                {{VideoFrameInit/displayHeight}} be the display size of the
+                decoded video frame in pixels.
+        4. Let |frame| be a {{VideoFrame}}, constructed with |pixelFormat|,
+            |planes|, and |frameInit|.
+        5. Invoke {{VideoDecoder/[[output callback]]}} with |frame|.
+  </dd>
+  <dt><dfn>Reset VideoDecoder</dfn></dt>
+  <dd>
+    Run these steps:
+    1. If {{VideoDecoder/state}} is `"closed"`, throw an {{InvalidStateError}}.
+    2. Set {{VideoDecoder/state}} to `"unconfigured"`.
+    3. Signal {{VideoDecoder/[[codec implementation]]}} to cease producing
+        output for the previous configuration.
+    4. [=Reset the control message queue=].
+    5. Set {{VideoDecoder/decodeQueueSize}} to zero.
+  </dd>
+  <dt><dfn>Close VideoDecoder</dfn> (with |error|)</dt>
+  <dd>
+    Run these steps:
+    1. Run the [=Reset VideoDecoder=] algorithm.
+    2. Set {{VideoDecoder/state}} to `"closed"`.
+    3. Clear {{VideoDecoder/[[codec implementation]]}} and release associated
+        [=system resources=].
+    4. If |error| is set, queue a task on the [=control thread=] event loop to
+        invoke the {{VideoDecoder/[[error callback]]}} with |error|.
+  </dd>
+</dl>
+
+
+AudioEncoder Interface {#audioencoder-interface}
+================================================
+
+<xmp class='idl'>
+[Exposed=(Window,DedicatedWorker)]
+interface AudioEncoder {
+  constructor(AudioEncoderInit init);
+
+  readonly attribute CodecState state;
+  readonly attribute long encodeQueueSize;
+
+  undefined configure(AudioEncoderConfig config);
+  undefined encode(AudioFrame frame);
+  Promise<undefined> flush();
+  undefined reset();
+  undefined close();
+
+  static Promise<AudioEncoderSupport> isConfigSupported(AudioEncoderConfig config);
+};
+
+dictionary AudioEncoderInit {
+  required EncodedAudioChunkOutputCallback output;
+  required WebCodecsErrorCallback error;
+};
+
+callback EncodedAudioChunkOutputCallback = undefined(EncodedAudioChunk output);
+</xmp>
+
+Internal Slots {#audioencoder-internal-slots}
+---------------------------------------------
+<dl>
+<dt><dfn attribute for=AudioEncoder>[[codec implementation]]</dfn></dt>
+<dd>Underlying encoder implementation provided by the User Agent.</dd>
+<dt><dfn attribute for=AudioEncoder>[[output callback]]</dfn></dt>
+<dd>Callback given at construction for encoded outputs.</dd>
+<dt><dfn attribute for=AudioEncoder>[[error callback]]</dfn></dt>
+<dd>Callback given at construction for encode errors.</dd>
+</dl>
+
+Constructors {#audioencoder-constructors}
+-----------------------------------------
+<dfn constructor for=AudioEncoder title="AudioEncoder(init)">
+  AudioEncoder(init)
+</dfn>
+1. Let e be a new AudioEncoder object.
+2. Assign `init.output` to the {{AudioEncoder/[[output callback]]}} internal slot.
+3. Assign `init.error` to the {{AudioEncoder/[[error callback]]}} internal slot.
+4. Assign "unconfigured" to `e.state`.
+5. Return e.
+
+Attributes {#audioencoder-attributes}
+-------------------------------------
+<dl>
+  <dt>
+    <dfn attribute for=AudioEncoder>state</dfn>
+  </dt>
+  <dd>Describes the current state of the codec.</dd>
+  <dt>
+    <dfn attribute for=AudioEncoder>encodeQueueSize</dfn>
+  </dt>
+  <dd>
+    The number of pending encode requests. This number will decrease as the
+    underlying codec is ready to accept new input.
+  </dd>
+</dl>
+
+Methods {#audioencoder-methods}
+-------------------------------
+<dl>
+  <dt><dfn method for=AudioEncoder>configure(config)</dfn></dt>
+  <dd>
+    [=Enqueues a control message=] to configure the audio encoder for
+    decoding chunks as described by |config|.
+
+    NOTE: This method will trigger a {{NotSupportedError}} if the user agent
+        does not support |config|. Authors should first check support by calling
+        {{AudioEncoder/isConfigSupported()}} with |config|. User agents are not
+        required to support any particular codec type or configuration.
+
+    When invoked, run these steps:
+    1. If |config| is not a [=valid AudioEncoderConfig=], throw a
+        {{TypeError}}.
+    2. If {{AudioEncoder/state}} is `"closed"`, throw an {{InvalidStateError}}.
+    3. Set {{AudioEncoder/state}} to `"configured"`.
+    4. [=Queue a control message=] to configure the encoder using |config|.
+
+    Running a control message to configure the encoder means performing these
+    steps:
+    1. Let |supported| be the result of running the <a>Check Configuration
+        Support</a> algorith with |config|.
+    2. If |supported| is `true`, assign
+        {{AudioEncoder/[[codec implementation]]}} with an implementation
+        supporting |config|.
+    3. Otherwise, run the <a>Close AudioEncoder</a> algorithm with
+        {{NotSupportedError}}.
+  </dd>
+
+  <dt><dfn method for=AudioEncoder>encode(frame)</dfn></dt>
+  <dd>
+    [=Enqueues a control message=] to encode the given |frame|.
+
+    When invoked, run these steps:
+    1. If the value of |frame|'s {{AudioFrame/[[detached]]}} internal slot is
+        `true`, throw a {{TypeError}}.
+    2. If {{AudioEncoder/state}} is not `"configured"`, throw an
+        {{InvalidStateError}}.
+    3. Let |frameClone| hold the result of running the [=Clone Frame=]
+        algorithm with |frame|.
+    4. Increment {{AudioEncoder/encodeQueueSize}}.
+    5. [=Queue a control message=] to encode |frameClone|.
+
+    Running a control message to encode the frame means performing these steps.
+    1. Attempt to use {{AudioEncoder/[[codec implementation]]}} to encode
+        |frameClone|.
+    2. If encoding results in an error, queue a task on the [=control thread=]
+        event loop to run the [=Close AudioEncoder=] algorithm with
+        {{EncodingError}}.
+    3. Queue a task on the [=control thread=] event loop to decrement
+        {{AudioEncoder/encodeQueueSize}}.
+    4. Let |encoded outputs| be a [=list=] of encoded audio data outputs
+        emitted by {{AudioEncoder/[[codec implementation]]}}.
+    5. If |encoded outputs| is not empty, queue a task on the [=control thread=]
+        event loop to run the [=Output EncodedAudioChunks=] algorithm with
+        |encoded outputs|.
+  </dd>
+
+  <dt><dfn method for=AudioEncoder>flush()</dfn></dt>
+  <dd>
+    Completes all [=control messages=] in the [=control message queue=]
+    and emits all outputs.
+
+    When invoked, run these steps:
+    1. If {{AudioEncoder/state}} is not `"configured"`, return
+        [=a promise rejected with=] {{InvalidStateError}} {{DOMException}}.
+    2. Let |promise| be a new Promise.
+    3. [=Queue a control message=] to flush the codec with |promise|.
+    4. Return |promise|.
+
+    Running a control message to flush the codec means performing these steps
+        with |promise|.
+    1. Signal {{AudioEncoder/[[codec implementation]]}} to emit all [=internal
+        pending outputs=].
+    2. Let |encoded outputs| be a [=list=] of encoded audio data outputs
+        emitted by {{AudioEncoder/[[codec implementation]]}}.
+    5. If |encoded outputs| is not empty, queue a task on the [=control thread=]
+        event loop to run the [=Output EncodedAudioChunks=] algorithm with
+        |encoded outputs|.
+    3. Queue a task on the [=control thread=] event loop to resolve |promise|.
+  </dd>
+
+  <dt><dfn method for=AudioEncoder>reset()</dfn></dt>
+  <dd>
+    Immediately resets all state including configuration,
+    [=control messages=] in the [=control message queue=], and all pending
+    callbacks.
+
+    When invoked, run the [=Reset AudioEncoder=] algorithm.
+  </dd>
+
+  <dt><dfn method for=AudioEncoder>close()</df></dt>
+  <dd>
+    Immediately aborts all pending work and releases [=system resources=].
+    Close is final.
+
+    When invoked, run the [=Close AudioEncoder=] algorithm.
+  </dd>
+
+  <dt><dfn method for=AudioEncoder>isConfigSupported(config)</dfn></dt>
+  <dd>
+    Returns a promise indicating whether the provided |config| is supported by
+    the user agent.
+
+    NOTE: The returned {{AudioEncoderSupport}} {{AudioEncoderSupport/config}}
+        will contain only the dictionary members that user agent recognized.
+        Unrecognized dictionary memebers will be ignored. Authors may detect
+        unrecognized dictionary members by comparinging
+        {{AudioEncoderSupport/config}} to their provided |config|.
+
+    When invoked, run these steps:
+    1. If |config| is not a <a>valid AudioEncoderConfig</a>, return
+        [=a promise rejected with=] {{TypeError}}.
+    2. Let |p| be a new Promise.
+    3. Let |checkSupportQueue| be the result of starting a new <a>parallel
+        queue</a>.
+    4. Enqueue the following steps to |checkSupportQueue|:
+        1. Let |encoderSupport| be a newly constructed
+            {{AudioEncoderSupport}}, initialized as follows:
+            1. Set {{AudioEncoderSupport/config}} to the result of running the
+                <a>Clone Configuration</a> algorithm with |config|.
+            2. Set {{AudioEncoderSupport/supported}} to the result of running
+                the <a>Check Configuration Support</a> algorithm with |config|.
+        2. Resolve |p| with |encoderSupport|.
+    5. Return  |p|.
+  </dd>
+</dl>
+
+Algorithms {#audioencoder-algorithms}
+-------------------------------------
+<dl>
+  <dt><dfn>Output EncodedAudioChunks</dfn> (with |outputs|)</dt>
+  <dd>
+    Run these steps:
+    1. For each |output| in |outputs|:
+        1. Let |chunkInit| be an {{EncodedAudioChunkInit}} with the following
+            keys:
+            1. Let {{EncodedAudioChunkInit/data}} contain the encoded audio data
+                from |output|.
+            2. Let {{EncodedAudioChunkInit/type}} be the
+                {{EncodedAudioChunkType}} of |output|.
+            3. Let {{EncodedAudioChunkInit/timestamp}} be the
+                {{AudioFrame/timestamp}} from the AudioFrame associated with
+                |output|.
+        2. Let |chunk| be a new {{EncodedAudioChunk}} constructed with
+            |chunkInit|.
+        3. Invoke {{AudioEncoder/[[output callback]]}} with |chunk|.
+  </dd>
+  <dt><dfn>Reset AudioEncoder</dfn></dt>
+  <dd>
+    Run these steps:
+    1. If {{AudioEncoder/state}} is `"closed"`, throw an {{InvalidStateError}}.
+    2. Set {{AudioEncoder/state}} to `"unconfigured"`.
+    3. Signal {{AudioEncoder/[[codec implementation]]}} to cease producing
+        output for the previous configuration.
+    4. [=Reset the control message queue=].
+    5. Set {{AudioEncoder/encodeQueueSize}} to zero.
+  </dd>
+  <dt><dfn>Close AudioEncoder</dfn> (with |error|)</dt>
+  <dd>
+    Run these steps:
+    1. Run the [=Reset AudioEncoder=] algorithm.
+    2. Set {{AudioEncoder/state}} to `"closed"`.
+    3. Clear {{AudioEncoder/[[codec implementation]]}} and release associated
+        [=system resources=].
+    4. If |error| is set, queue a task on the [=control thread=] event loop
+        invoke the {{AudioEncoder/[[error callback]]}} with |error|.
+  </dd>
+</dl>
+
+VideoEncoder Interface {#videoencoder-interface}
+================================================
+
+<xmp class='idl'>
+[Exposed=(Window,DedicatedWorker)]
+interface VideoEncoder {
+  constructor(VideoEncoderInit init);
+
+  readonly attribute CodecState state;
+  readonly attribute long encodeQueueSize;
+
+  undefined configure(VideoEncoderConfig config);
+  undefined encode(VideoFrame frame, optional VideoEncoderEncodeOptions options = {});
+  Promise<undefined> flush();
+  undefined reset();
+  undefined close();
+
+  static Promise<boolean> isConfigSupported(VideoEncoderConfig config);
+};
+
+dictionary VideoEncoderInit {
+  required EncodedVideoChunkOutputCallback output;
+  required WebCodecsErrorCallback error;
+};
+
+callback EncodedVideoChunkOutputCallback = undefined(EncodedVideoChunk output, VideoDecoderConfig? output_config);
+</xmp>
+
+Internal Slots {#videoencoder-internal-slots}
+---------------------------------------------
+<dl>
+<dt><dfn attribute for=VideoEncoder>[[codec implementation]]</dfn></dt>
+<dd>Underlying encoder implementation provided by the User Agent.</dd>
+<dt><dfn attribute for=VideoEncoder>[[output callback]]</dfn></dt>
+<dd>Callback given at construction for encoded outputs.</dd>
+<dt><dfn attribute for=VideoEncoder>[[error callback]]</dfn></dt>
+<dd>Callback given at construction for encode errors.</dd>
+<dt><dfn attribute for=VideoEncoder>[[active encoder config]]</dfn></dt>
+<dd>The {{VideoEncoderConfig}} that is actively applied.</dd>
+<dt><dfn attribute for=VideoEncoder>[[active output config]]</dfn></dt>
+<dd>
+  The {{VideoDecoderConfig}} that describes how to decode the most recently
+  emitted {{EncodedVideoChunk}}.
+</dd>
+</dl>
+
+Constructors {#videoencoder-constructors}
+-----------------------------------------
+<dfn constructor for=VideoEncoder title="VideoEncoder(init)">
+  VideoEncoder(init)
+</dfn>
+1. Let e be a new VideoEncoder object.
+2. Assign `init.output` to the {{VideoEncoder/[[output callback]]}} internal slot.
+3. Assign `init.error` to the {{VideoEncoder/[[error callback]]}} internal slot.
+4. Assign "unconfigured" to `e.state`.
+5. Return e.
+
+Attributes {#videoencoder-attributes}
+-------------------------------------
+<dl>
+  <dt>
+    <dfn attribute for=VideoEncoder>state</dfn>
+  </dt>
+  <dd>Describes the current state of the codec.</dd>
+  <dt>
+    <dfn attribute for=VideoEncoder>encodeQueueSize</dfn>
+  </dt>
+  <dd>
+    The number of pending encode requests. This number will decrease as the
+    underlying codec is ready to accept new input.
+  </dd>
+</dl>
+
+Methods {#videoencoder-methods}
+-------------------------------
+<dl>
+  <dt><dfn method for=VideoEncoder>configure(config)</dfn></dt>
+  <dd>
+    [=Enqueues a control message=] to configure the video encoder for
+    decoding chunks as described by |config|.
+
+    NOTE: This method will trigger a {{NotSupportedError}} if the user agent
+        does not support |config|. Authors should first check support by calling
+        {{VideoEncoder/isConfigSupported()}} with |config|. User agents are not
+        required to support any particular codec type or configuration.
+
+    When invoked, run these steps:
+    1. If |config| is not a [=valid VideoEncoderConfig=], throw a
+        {{TypeError}}.
+    2. If {{VideoEncoder/state}} is `"closed"`, throw an {{InvalidStateError}}.
+    3. Set {{VideoEncoder/state}} to `"configured"`.
+    4. [=Queue a control message=] to configure the encoder using |config|.
+
+    Running a control message to configure the encoder means performing these
+    steps:
+    1. Let |supported| be the result of running the <a>Check Configuration
+        Support</a> algorith with |config|.
+    2. If |supported| is `true`, assign
+        {{VideoEncoder/[[codec implementation]]}} with an implementation
+        supporting |config|.
+    3. Otherwise, run the <a>Close VideoEncoder</a> algorithm with
+        {{NotSupportedError}} and abort these steps.
+    2. Set {{VideoEncoder/[[active encoder config]]}} to `config`.
+  </dd>
+
+  <dt><dfn method for=VideoEncoder>encode(frame, options)</dfn></dt>
+  <dd>
+    [=Enqueues a control message=] to encode the given |frame|.
+
+    When invoked, run these steps:
+    1. If the value of |frame|'s {{VideoFrame/[[detached]]}} internal slot is
+        `true`, throw a {{TypeError}}.
+    2. If {{VideoEncoder/state}} is not `"configured"`, throw an
+        {{InvalidStateError}}.
+    3. Let |frameClone| hold the result of running the [=Clone Frame=]
+        algorithm with |frame|.
+    4. Increment {{VideoEncoder/encodeQueueSize}}.
+    5. [=Queue a control message=] to encode |frameClone|.
+
+    Running a control message to encode the frame means performing these steps.
+    1. Attempt to use {{VideoEncoder/[[codec implementation]]}} to encode
+        |frameClone| according to |options|.
+    2. If encoding results in an error, queue a task on the [=control thread=]
+        event loop to run the [=Close VideoEncoder=] algorithm with
+        {{EncodingError}}.
+    3. Queue a task on the [=control thread=] event loop to decrement
+        {{VideoEncoder/encodeQueueSize}}.
+    4. Let |encoded outputs| be a [=list=] of encoded video data outputs
+        emitted by {{VideoEncoder/[[codec implementation]]}}.
+    5. If |encoded outputs| is not empty, queue a task on the [=control thread=]
+        event loop to run the [=Output EncodedVideoChunks=] algorithm with
+        |encoded outputs|.
+  </dd>
+
+  <dt><dfn method for=VideoEncoder>flush()</dfn></dt>
+  <dd>
+    Completes all [=control messages=] in the [=control message queue=]
+    and emits all outputs.
+
+    When invoked, run these steps:
+    1. If {{VideoEncoder/state}} is not `"configured"`, return
+        [=a promise rejected with=] {{InvalidStateError}} {{DOMException}}.
+    2. Let |promise| be a new Promise.
+    3. [=Queue a control message=] to flush the codec with |promise|.
+    4. Return |promise|.
+
+    Running a control message to flush the codec means performing these steps
+        with |promise|.
+    1. Signal {{VideoEncoder/[[codec implementation]]}} to emit all [=internal
+        pending outputs=].
+    2. Let |encoded outputs| be a [=list=] of encoded video data outputs
+        emitted by {{VideoEncoder/[[codec implementation]]}}.
+    5. If |encoded outputs| is not empty, queue a task on the [=control thread=]
+        event loop to run the [=Output EncodedVideoChunks=] algorithm with
+        |encoded outputs|.
+    3. Queue a task on the [=control thread=] event loop to resolve |promise|.
+  </dd>
+
+  <dt><dfn method for=VideoEncoder>reset()</dfn></dt>
+  <dd>
+    Immediately resets all state including configuration,
+    [=control messages=] in the [=control message queue=], and all pending
+    callbacks.
+
+    When invoked, run the [=Reset VideoEncoder=] algorithm.
+  </dd>
+
+  <dt><dfn method for=VideoEncoder>close()</df></dt>
+  <dd>
+    Immediately aborts all pending work and releases [=system resources=].
+    Close is final.
+
+    When invoked, run the [=Close VideoEncoder=] algorithm.
+  </dd>
+
+  <dt><dfn method for=VideoEncoder>isConfigSupported(config)</dfn></dt>
+  <dd>
+    Returns a promise indicating whether the provided |config| is supported by
+    the user agent.
+
+    NOTE: The returned {{VideoEncoderSupport}} {{VideoEncoderSupport/config}}
+        will contain only the dictionary members that user agent recognized.
+        Unrecognized dictionary memebers will be ignored. Authors may detect
+        unrecognized dictionary members by comparinging
+        {{VideoEncoderSupport/config}} to their provided |config|.
+
+    When invoked, run these steps:
+    1. If |config| is not a <a>valid VideoEncoderConfig</a>, return
+        [=a promise rejected with=] {{TypeError}}.
+    2. Let |p| be a new Promise.
+    3. Let |checkSupportQueue| be the result of starting a new <a>parallel
+        queue</a>.
+    4. Enqueue the following steps to |checkSupportQueue|:
+        1. Let |encoderSupport| be a newly constructed
+            {{VideoEncoderSupport}}, initialized as follows:
+            1. Set {{VideoEncoderSupport/config}} to the result of running the
+                <a>Clone Configuration</a> algorithm with |config|.
+            2. Set {{VideoEncoderSupport/supported}} to the result of running
+                the <a>Check Configuration Support</a> algorithm with |config|.
+        2. Resolve |p| with |encoderSupport|.
+    5. Return  |p|.
+  </dd>
+</dl>
+
+Algorithms {#videoencoder-algorithms}
+-------------------------------------
+<dl>
+  <dt><dfn>Output EncodedVideoChunks</dfn> (with |outputs|)</dt>
+  <dd>
+    Run these steps:
+    1. For each |output| in |outputs|:
+        1. Let |encoder_config| be the
+            {{VideoEncoder/[[active encoder config]]}}.
+
+            ISSUE: The intent is for |encoder_config| to be the
+                {{VideoEncoder/[[active encoder config]]}} that was used to
+                encode |output|. But, as written, it may occur that |output| was
+                encoded using a previous {{VideoEncoderConfig}} that has since
+                been replaced by a later call to {{VideoEncoder/configure()}}.
+                See [#138](https://github.com/w3c/webcodecs/issues/138).
+
+        2. Let |output_config| be a {{VideoDecoderConfig}} that describes
+            |output|. Initialize |output_config| as follows:
+            1. Assign `encoder_config.codec` to `output_config.codec`.
+            2. Assign `encoder_config.width` to `output_config.cropWidth`.
+            3. Assign `encoder_config.height` to `output_config.cropHeight`.
+            4. Assign `encoder_config.displayWidth` to
+                `output_config.displayWidth`.
+            5. Assign `encoder_config.displayHeight` to
+                `output_config.displayHeight`.
+            6. Assign the remaining keys of `output_config` as determined by
+                {{VideoEncoder/[[codec implementation]]}}. The user agent
+                must ensure that the configuration is completely described
+                such that |output_config| could be used to correctly decode
+                |output|.
+
+                NOTE: This includes supplying the
+                    {{VideoDecoderConfig/description}} to describe codec
+                    specific "extradata", the use of which may be further
+                    described in codec registrations listed in the
+                    [[WEBCODECS-CODEC-REGISTRY]].
+        3. If |output_config| and {{VideoEncoder/[[active output config]]}} are
+            <a>equal dictionaries</a>, set |output_config| to null. Otherwise,
+            set {{VideoEncoder/[[active output config]]}} to |output_config|.
+
+            NOTE: The {{VideoDecoderConfig}} |output_config| will be `null`
+                if the configuration hasn't changed from previous outputs. The
+                first output will always include a non-null |output_config|.
+
+        4. Let |chunkInit| be an {{EncodedVideoChunkInit}} with the following
+            keys:
+            1. Let {{EncodedVideoChunkInit/data}} contain the encoded video data
+                from |output|.
+            2. Let {{EncodedVideoChunkInit/type}} be the
+                {{EncodedVideoChunkType}} of |output|.
+            3. Let {{EncodedVideoChunkInit/timestamp}} be the
+                {{VideoFrame/[[timestamp]]}} from the {{VideoFrame}}
+                associated with |output|.
+            4. Let {{EncodedVideoChunkInit/duration}} be the
+                {{VideoFrame/[[duration]]}} from the {{VideoFrame}} associated
+                with |output|.
+        5. Let |chunk| be a new {{EncodedVideoChunk}} constructed with
+            |chunkInit|.
+        6. Invoke {{VideoEncoder/[[output callback]]}} with |chunk|.
+  </dd>
+  <dt><dfn>Reset VideoEncoder</dfn></dt>
+  <dd>
+    Run these steps:
+    1. If {{VideoEncoder/state}} is `"closed"`, throw an {{InvalidStateError}}.
+    2. Set {{VideoEncoder/state}} to `"unconfigured"`.
+    3. Set {{VideoEncoder/[[active encoder config]]}} to `null`.
+    4. Set {{VideoEncoder/[[active output config]]}} to `null`.
+    5. Signal {{VideoEncoder/[[codec implementation]]}} to cease producing
+        output for the previous configuration.
+    6. [=Reset the control message queue=].
+    7. Set {{VideoEncoder/encodeQueueSize}} to zero.
+  </dd>
+  <dt><dfn>Close VideoEncoder</dfn> (with |error|)</dt>
+  <dd>
+    Run these steps:
+    1. Run the [=Reset VideoEncoder=] algorithm.
+    2. Set {{VideoEncoder/state}} to `"closed"`.
+    3. Clear {{VideoEncoder/[[codec implementation]]}} and release associated
+        [=system resources=].
+    4. If |error| is set, queue a task on the [=control thread=] event loop
+        invoke the {{VideoEncoder/[[error callback]]}} with |error|.
+  </dd>
+</dl>
+
+
+Configurations{#configurations}
+===============================
+
+<dfn>Check Configuration Support</dfn> (with |config|) {#config-support}
+------------------------------------------------------------------------
+Run these steps:
+1. If the user agent can provide a <a>codec</a> to support all entries of the
+    |config|, including applicable default values for keys that are not
+    included, return `true`.
+
+    NOTE: The types {{AudioDecoderConfig}}, {{VideoDecoderConfig}},
+        {{AudioEncoderConfig}}, and {{VideoEncoderConfig}} each define their
+        respective configuration entries and defaults.
+
+    NOTE: Support for a given configuration may change dynamically if the
+        hardware is altered (e.g. external GPU unplugged) or if required
+        hardware resources are exhausted. User agents should describe support on
+        a best-effort basis given the resources that are available at the time
+        of the query.
+
+2. Otherwise, return false.
+
+<dfn>Clone Configuration</dfn> (with |config|) {#clone-config}
+--------------------------------------------------------------
+
+NOTE: This algorithm will copy only the dictionary members that the user agent
+    recognizes as part of the dictionary type.
+
+Run these steps:
+1. Let |dictType| be the type of dictionary |config|.
+2. Let <var ignore=''>clone</var> be a new empty instance of |dictType|.
+3. For each dictionary member |m| defined on |dictType|:
+    1. If |m| does not [=map/exist=] in |config|, then [=iteration/continue=].
+    2. If `config[m]` is a nested dictionary, set `clone[m]` to the result of
+        recursively running the <a>Clone Configuration</a> algorithm with
+        `config[m]`.
+    3. Otherwise, assign the value of `config[m]` to `clone[m]`.
+
+
+Signalling Configuration Support{#config-support-info}
+------------------------------------------------------
+
+### AudioDecoderSupport ### {#audio-decoder-support}
+<xmp class='idl'>
+dictionary AudioDecoderSupport {
+  boolean supported;
+  AudioDecoderConfig config;
+};
+</xmp>
+
+<dl>
+  <dt><dfn dict-member for=AudioDecoderSupport>supported</dfn></dt>
+  <dd>
+    A boolean indicating the whether the corresponding
+    {{AudioDecoderSupport/config}} is supported by the user agent.
+  </dd>
+  <dt><dfn dict-member for=AudioDecoderSupport>config</dfn></dt>
+  <dd>
+    An {{AudioDecoderConfig}} used by the user agent in determining the value of
+    {{AudioDecoderSupport/supported}}.
+  </dd>
+</dl>
+
+### VideoDecoderSupport ### {#video-decoder-support}
+<xmp class='idl'>
+dictionary VideoDecoderSupport {
+  boolean supported;
+  VideoDecoderConfig config;
+};
+</xmp>
+
+<dl>
+  <dt><dfn dict-member for=VideoDecoderSupport>supported</dfn></dt>
+  <dd>
+    A boolean indicating the whether the corresponding
+    {{VideoDecoderSupport/config}} is supported by the user agent.
+  </dd>
+  <dt><dfn dict-member for=VideoDecoderSupport>config</dfn></dt>
+  <dd>
+    A {{VideoDecoderConfig}} used by the user agent in determining the value of
+    {{VideoDecoderSupport/supported}}.
+  </dd>
+</dl>
+
+### AudioEncoderSupport ### {#audio-encoder-support}
+<xmp class='idl'>
+dictionary AudioEncoderSupport {
+  boolean supported;
+  AudioEncoderConfig config;
+};
+</xmp>
+
+<dl>
+  <dt><dfn dict-member for=AudioEncoderSupport>supported</dfn></dt>
+  <dd>
+    A boolean indicating the whether the corresponding
+    {{AudioEncoderSupport/config}} is supported by the user agent.
+  </dd>
+  <dt><dfn dict-member for=AudioEncoderSupport>config</dfn></dt>
+  <dd>
+    An {{AudioEncoderConfig}} used by the user agent in determining the value of
+    {{AudioEncoderSupport/supported}}.
+  </dd>
+</dl>
+
+### VideoEncoderSupport ### {#video-encoder-support}
+<xmp class='idl'>
+dictionary VideoEncoderSupport {
+  boolean supported;
+  VideoEncoderConfig config;
+};
+</xmp>
+
+<dl>
+  <dt><dfn dict-member for=VideoEncoderSupport>supported</dfn></dt>
+  <dd>
+    A boolean indicating the whether the corresponding
+    {{VideoEncoderSupport/config}} is supported by the user agent.
+  </dd>
+  <dt><dfn dict-member for=VideoEncoderSupport>config</dfn></dt>
+  <dd>
+    A {{VideoEncoderConfig}} used by the user agent in determining the value of
+    {{VideoEncoderSupport/supported}}.
+  </dd>
+</dl>
+
+<dfn export>Codec String</dfn>{#config-codec-string}
+----------------------------------------------------
+A codec string describes a given codec format to be used for encoding or
+decoding.
+
+A <dfn>valid codec string</dfn> must meet the following conditions.
+1. Is valid per the relevant codec specification (see examples below).
+2. It describes a single codec.
+3. It is unambiguous about codec profile and level for codecs that define these
+    concepts.
+
+NOTE: In other media specifications, codec strings historically accompanied a
+    [=MIME type=] as the "codecs=" parameter
+    ({{MediaSource/isTypeSupported()}}, {{HTMLMediaElement/canPlayType()}})
+    [[RFC6381]]. In this specification, encoded media is not containerized;
+    hence, only the value of the codecs parameter is accepted.
+
+The format and semantics for codec strings are defined by codec registrations
+listed in the [[WEBCODECS-CODEC-REGISTRY]]. A compliant implementation may support any
+combination of codec registrations or none at all.
+
+AudioDecoderConfig{#audio-decoder-config}
+-----------------------------------------
+<xmp class='idl'>
+dictionary AudioDecoderConfig {
+  required DOMString codec;
+  required unsigned long sampleRate;
+  required unsigned long numberOfChannels;
+  BufferSource description;
+};
+</xmp>
+
+To check if an {{AudioDecoderConfig}} is a <dfn>valid AudioDecoderConfig</dfn>,
+    run these steps:
+1. If codec is not a <a>valid codec string</a>, return `false`.
+2. Return `true`.
+
+<dl>
+  <dt><dfn dict-member for=AudioDecoderConfig>codec</dfn></dt>
+  <dd>Contains a <a>codec string</a> describing the codec.</dd>
+
+  <dt><dfn dict-member for=AudioDecoderConfig>sampleRate</dfn></dt>
+  <dd>The number of frame samples per second.</dd>
+
+  <dt><dfn dict-member for=AudioDecoderConfig>numberOfChannels</dfn></dt>
+  <dd>The number of audio channels.</dd>
+
+  <dt><dfn dict-member for=AudioDecoderConfig>description</dfn></dt>
+  <dd>
+    A sequence of codec specific bytes, commonly known as extradata.
+
+    NOTE: The registrations in the [[WEBCODECS-CODEC-REGISTRY]] describe whether/how to
+        populate this sequence, corresponding to the provided
+        {{AudioDecoderConfig/codec}}.
+  </dd>
+</dl>
+
+
+VideoDecoderConfig{#video-decoder-config}
+-----------------------------------------
+<xmp class='idl'>
+dictionary VideoDecoderConfig {
+  required DOMString codec;
+  BufferSource description;
+  unsigned long codedWidth;
+  unsigned long codedHeight;
+  unsigned long cropLeft;
+  unsigned long cropTop;
+  unsigned long cropWidth;
+  unsigned long cropHeight;
+  unsigned long displayWidth;
+  unsigned long displayHeight;
+  HardwareAcceleration hardwareAcceleration = "allow";
+};
+</xmp>
+
+To check if a {{VideoDecoderConfig}} is a <dfn>valid VideoDecoderConfig</dfn>,
+run these steps:
+1. If {{VideoDecoderConfig/codec}} is not a <a>valid codec string</a>, return
+    `false`.
+2. If {{VideoDecoderConfig/codedWidth}} = 0 or
+    {{VideoDecoderConfig/codedHeight}} = 0, return `false`.
+3. If {{VideoDecoderConfig/cropWidth}} = 0 or {{VideoDecoderConfig/cropHeight}}
+    = 0, return `false`.
+4. If {{VideoDecoderConfig/cropTop}} + {{VideoDecoderConfig/cropHeight}} >=
+    {{VideoDecoderConfig/codedHeight}}, return `false`.
+5. If {{VideoDecoderConfig/cropLeft}} + {{VideoDecoderConfig/cropWidth}} >=
+    {{VideoDecoderConfig/codedWidth}}, return `false`.
+6. If {{VideoDecoderConfig/displayWidth}} = 0 or
+    {{VideoDecoderConfig/displayHeight}} = 0, return `false`.
+7. Return `true`.
+
+<dl>
+  <dt><dfn dict-member for=VideoDecoderConfig>codec</dfn></dt>
+  <dd>Contains a codec string describing the codec.</dd>
+
+  <dt><dfn dict-member for=VideoDecoderConfig>description</dfn></dt>
+  <dd>
+    A sequence of codec specific bytes, commonly known as extradata.
+
+    NOTE: The registrations in the [[WEBCODECS-CODEC-REGISTRY]] may describe whether/how
+        to populate this sequence, corresponding to the provided
+        {{VideoDecoderConfig/codec}}.
+  </dd>
+
+  <dt><dfn dict-member for=VideoDecoderConfig>codedWidth</dfn></dt>
+  <dd>
+    Width of the VideoFrame in pixels, prior to any cropping or aspect ratio
+        adjustments.
+  </dd>
+
+  <dt><dfn dict-member for=VideoDecoderConfig>codedHeight</dfn></dt>
+  <dd>
+    Height of the VideoFrame in pixels, prior to any cropping or aspect ratio
+        adjustments.
+  </dd>
+
+  <dt><dfn dict-member for=VideoDecoderConfig>cropLeft</dfn></dt>
+  <dd>
+    The number of pixels to remove from the left of the VideoFrame, prior to
+        aspect ratio adjustments. Defaults to zero if not present.
+  </dd>
+
+  <dt><dfn dict-member for=VideoDecoderConfig>cropTop</dfn></dt>
+  <dd>
+    The number of pixels to remove from the top of the VideoFrame, prior to
+        aspect ratio adjustments. Defaults to zero if not present.
+  </dd>
+
+  <dt><dfn dict-member for=VideoDecoderConfig>cropWidth</dfn></dt>
+  <dd>
+    The width in pixels to include in the crop, starting from cropLeft.
+        Defaults to codedWidth if not present.
+  </dd>
+
+  <dt><dfn dict-member for=VideoDecoderConfig>cropHeight</dfn></dt>
+  <dd>
+    The height in pixels to include in the crop, starting from cropLeft.
+        Defaults to codedHeight if not present.
+  </dd>
+
+  <dt><dfn dict-member for=VideoDecoderConfig>displayWidth</dfn></dt>
+  <dd>
+    Width of the VideoFrame when displayed. Defaults to cropWidth if not
+        present.
+  </dd>
+
+  <dt><dfn dict-member for=VideoDecoderConfig>displayHeight</dfn></dt>
+  <dd>
+    Height of the VideoFrame when displayed. Defaults to cropHeight if not
+        present.
+  </dd>
+
+  <dt><dfn dict-member for=VideoDecoderConfig>hardwareAcceleration</dfn></dt>
+  <dd>
+    Configures hardware acceleration for this codec. See
+    {{HardwareAcceleration}}.
+  </dd>
+</dl>
+
+
+AudioEncoderConfig{#audio-encoder-config}
+-----------------------------------------
+<xmp class='idl'>
+dictionary AudioEncoderConfig {
+  required DOMString codec;
+  unsigned long sampleRate;
+  unsigned long numberOfChannels;
+  unsigned long long bitrate;
+};
+</xmp>
+
+NOTE: Codec-specific extensions to {{AudioEncoderConfig}} may be defined by the
+    registrations in the [[WEBCODECS-CODEC-REGISTRY]].
+
+To check if an {{AudioEncoderConfig}} is a <dfn>valid AudioEncoderConfig</dfn>,
+run these steps:
+1. If {{AudioEncoderConfig/codec}} is not a <a>valid codec string</a>, return
+    `false`.
+2. Return `true`.
+
+<dl>
+  <dt><dfn dict-member for=AudioEncoderConfig>codec</dfn></dt>
+  <dd>Contains a codec string describing the codec.</dd>
+
+  <dt><dfn dict-member for=AudioEncoderConfig>sampleRate</dfn></dt>
+  <dd>The number of frame samples per second.</dd>
+
+  <dt><dfn dict-member for=AudioEncoderConfig>numberOfChannels</dfn></dt>
+  <dd>The number of audio channels.</dd>
+
+  <dt><dfn dict-member for=AudioEncoderConfig>bitrate</dfn></dt>
+  <dd>
+    The average bitrate of the encoded audio given in units of bits per second.
+  </dd>
+</dl>
+
+
+VideoEncoderConfig{#video-encoder-config}
+-----------------------------------------
+<xmp class='idl'>
+dictionary VideoEncoderConfig {
+  required DOMString codec;
+  unsigned long long bitrate;
+  required unsigned long width;
+  required unsigned long height;
+  unsigned long displayWidth;
+  unsigned long displayHeight;
+  HardwareAcceleration hardwareAcceleration = "allow";
+};
+</xmp>
+
+NOTE: Codec-specific extensions to {{VideoEncoderConfig}} may be defined by the
+    registrations in the [[WEBCODECS-CODEC-REGISTRY]].
+
+To check if a {{VideoEncoderConfig}} is a <dfn>valid VideoEncoderConfig</dfn>,
+    run these steps:
+1. If {{VideoEncoderConfig/codec}} is not a <a>valid codec string</a>, return
+    `false`.
+2. If {{VideoEncoderConfig/width}} = 0 or {{VideoEncoderConfig/height}}
+    = 0, return `false`.
+3. If {{VideoEncoderConfig/displayWidth}} = 0 or
+    {{VideoEncoderConfig/displayHeight}} = 0, return `false`.
+4. Return `true`.
+
+<dl>
+  <dt><dfn dict-member for=VideoEncoderConfig>codec</dfn></dt>
+  <dd>Contains a <a>codec string</a> describing the codec.</dd>
+
+  <dt><dfn dict-member for=VideoEncoderConfig>bitrate</dfn></dt>
+  <dd>The average bitrate of the encoded video given in units of bits per second.</dd>
+
+  <dt><dfn dict-member for=VideoEncoderConfig>width</dfn></dt>
+  <dd>
+    The encoded width of output {{EncodedVideoChunk}}s in pixels, prior to any
+    display aspect ratio adjustments.
+
+    The encoder must scale any {{VideoFrame}} who's
+    {{VideoFrame/[[crop width]]}} differs from this value.
+  </dd>
+
+  <dt><dfn dict-member for=VideoEncoderConfig>height</dfn></dt>
+  <dd>
+    The encoded height of output {{EncodedVideoChunk}}s in pixels, prior to any
+    display aspect ratio adjustments.
+
+    The encoder must scale any {{VideoFrame}} who's
+    {{VideoFrame/[[crop height]]}} differs from this value.
+  </dd>
+</dl>
+
+<dl>
+  <dt><dfn dict-member for=VideoEncoderConfig>displayWidth</dfn></dt>
+  <dd>
+    The intended display width of output {{EncodedVideoChunk}}s in pixels.
+    Defaults to {{VideoEncoderConfig/width}} if not present.
+  </dd>
+
+  <dt><dfn dict-member for=VideoEncoderConfig>displayHeight</dfn></dt>
+  <dd>
+    The intended display height of output {{EncodedVideoChunk}}s in pixels.
+    Defaults to {{VideoEncoderConfig/width}} if not present.
+  </dd>
+</dl>
+
+<div class='note'>
+  NOTE: Providing a {{VideoEncoderConfig/displayWidth}} or
+      {{VideoEncoderConfig/displayHeight}} that differs from
+      {{VideoEncoderConfig/width}} and {{VideoEncoderConfig/height}} signals
+      that chunks should be scaled after decoding to arrive at the final
+      display aspect ratio.
+
+      For many codecs this is merely pass-through information, but some codecs
+      may optionally include display sizing in the bitstream.
+</div>
+
+<dl>
+  <dt><dfn dict-member for=VideoEncoderConfig>hardwareAcceleration</dfn></dt>
+  <dd>
+    Configures hardware acceleration for this codec. See
+    {{HardwareAcceleration}}.
+  </dd>
+</dl>
+
+Hardware Acceleration{#hardware-acceleration}
+---------------------------------------------
+<xmp class='idl'>
+enum HardwareAcceleration {
+  "allow",
+  "deny",
+  "require",
+};
+</xmp>
+
+When supported, hardware acceleration offloads encoding or decoding to
+specialized hardware.
+
+<div class='note'>
+  NOTE: Most authors will be best served by using the default of
+  {{HardwareAcceleration/allow}}. This gives the user agent flexibility to
+  optimize based on its knowledge of the system and configuration. A common
+  strategy will be to prioritize hardware acceleration at higher resolutions
+  with a fallback to software codecs if hardware acceleration fails.
+
+  Authors should carefully weigh the tradeoffs setting a hardware acceleration
+  preference. The precise trade-offs will be device-specific, but authors should
+  generally expect the following:
+
+  * Setting a value of {{HardwareAcceleration/require}} may significantly
+      restrict what configurations are supported. It may occur that the user's
+      device does not offer acceleration for any codec, or only for the most
+      common profiles of older codecs.
+  * Hardware acceleration does not simply imply faster encoding / decoding.
+      Hardware acceleration often has higher startup latency but more consistent
+      throughput performance. Acceleration will generally reduce CPU load.
+  * For decoding, hardware acceleration is often less robust to inputs that are
+      mislabeled or violate the relevant codec specification.
+  * Hardware acceleration will often be more power efficient than purely
+      software based codecs.
+  * For lower resolution content, the overhead added by hardware acceleration
+      may yield decreased performance and power efficiency compared to purely
+      software based codecs.
+
+  Given these tradeoffs, a good example of using "require" would be if an author
+  intends to provide their own software based fallback via WebAssembly.
+
+  Alternatively, a good example of using "disallow" would be if an author is
+  especially sensitive to the higher startup latency or decreased robustness
+  generally associated with hardware acceleration.
+</div>
+
+<dl>
+  <dt><dfn enum-value for=HardwareAcceleration>allow</dfn></dt>
+  <dd>
+    Indicates that the user agent may use hardware acceleration if it is
+    available and compatible with other aspects of the codec configuration.
+  </dd>
+  <dt><dfn enum-value for=HardwareAcceleration>deny</dfn></dt>
+  <dd>
+    Indicates that the user agent must not use hardware acceleration.
+
+    NOTE: This will cause the configuration to be unsupported on platforms where
+    an unaccelerated codec is unavailable or is incompatible with other aspects
+    of the codec configuration.
+  </dd>
+  <dt><dfn enum-value for=HardwareAcceleration>require</dfn></dt>
+  <dd>
+    Indicates that the user agent must use hardware acceleration.
+
+    NOTE: This will cause the configuration to be unsupported on platforms where
+    an accelerated codec is unavailable or is incompatible with other aspects of
+    the codec configuration.
+  </dd>
+</dl>
+
+Configuration Equivalence{#config-equivalence}
+----------------------------------------------
+Two dictionaries are <dfn>equal dictionaries</dfn> if they contain the same
+keys and values. For nested dictionaries, apply this definition recursively.
+
+
+VideoEncoderEncodeOptions{#video-encoder-options}
+-------------------------------------------------
+
+<xmp class='idl'>
+dictionary VideoEncoderEncodeOptions {
+  boolean keyFrame = false;
+};
+</xmp>
+
+<dl>
+  <dt><dfn dict-member for=VideoEncoderEncodeOptions>keyFrame</dfn></dt>
+  <dd>
+    A value of `true` indicates that the given frame MUST be encoded as a key
+    frame. A value of `false` indicates that the user agent has flexibility to
+    decide whether the frame will be encoded as a key frame.
+  </dd>
+</dl>
+
+
+CodecState{#codec-state}
+------------------------
+<xmp class='idl'>
+enum CodecState {
+  "unconfigured",
+  "configured",
+  "closed"
+};
+</xmp>
+
+<dl>
+  <dt><dfn enum-value for=CodecState>unconfigured</dfn></dt>
+  <dd>The codec is not configured for encoding or decoding.</dd>
+  <dt><dfn enum-value for=CodecState>configured</dfn></dt>
+  <dd>
+    A valid configuration has been provided. The codec is ready for encoding or
+        decoding.
+  </dd>
+  <dt><dfn enum-value for=CodecState>closed</dfn></dt>
+  <dd>
+    The codec is no longer usable and underlying [=system resources=] have
+        been released.
+  </dd>
+</dl>
+
+WebCodecsErrorCallback{#error-callback}
+---------------------------------------
+<xmp class='idl'>
+callback WebCodecsErrorCallback = undefined(DOMException error);
+</xmp>
+
+
+Encoded Media Interfaces (Chunks) {#encoded-media-interfaces}
+=============================================================
+These interfaces represent chunks of encoded media.
+
+EncodedAudioChunk Interface {#encodedaudiochunk-interface}
+------------------------------------------------------------
+<xmp class='idl'>
+[Exposed=(Window,DedicatedWorker)]
+interface EncodedAudioChunk {
+  constructor(EncodedAudioChunkInit init);
+  readonly attribute EncodedAudioChunkType type;
+  readonly attribute unsigned long long timestamp;  // microseconds
+  readonly attribute ArrayBuffer data;
+};
+
+dictionary EncodedAudioChunkInit {
+  required EncodedAudioChunkType type;
+  required unsigned long long timestamp;
+  required BufferSource data;
+};
+
+enum EncodedAudioChunkType {
+    "key",
+    "delta",
+};
+</xmp>
+
+### Constructors ###{#encodedaudiochunk-constructors}
+<dfn constructor for=EncodedAudioChunk title="EncodedAudioChunk(init)">
+  EncodedAudioChunk(init)
+</dfn>
+1. Let |chunk| be a new {{EncodedAudioChunk}} object, initialized as follows
+    1. Assign `init.type` to `chunk.type`.
+    2. Assign `init.timestamp` to `chunk.timestamp`.
+    3. Assign a copy of `init.data` to `chunk.data`.
+5. Return |chunk|.
+
+### Attributes ###{#encodedaudiochunk-attributes}
+<dl>
+  <dt><dfn attribute for=EncodedAudioChunk>type</dfn></dt>
+  <dd>Describes whether the chunk is a key frame.</dd>
+
+  <dt><dfn attribute for=EncodedAudioChunk>timestamp</dfn></dt>
+  <dd>The presentation timestamp, given in microseconds.</dd>
+
+  <dt><dfn attribute for=EncodedAudioChunk>data</dfn></dt>
+  <dd>A sequence of bytes containing encoded audio data.</dd>
+</dl>
+
+EncodedVideoChunk Interface{#encodedvideochunk-interface}
+-----------------------------------------------------------
+<xmp class='idl'>
+[Exposed=(Window,DedicatedWorker)]
+interface EncodedVideoChunk {
+  constructor(EncodedVideoChunkInit init);
+  readonly attribute EncodedVideoChunkType type;
+  readonly attribute unsigned long long timestamp;  // microseconds
+  readonly attribute unsigned long long? duration;  // microseconds
+  readonly attribute ArrayBuffer data;
+};
+
+dictionary EncodedVideoChunkInit {
+  required EncodedVideoChunkType type;
+  required unsigned long long timestamp;
+  unsigned long long duration;
+  required BufferSource data;
+};
+
+enum EncodedVideoChunkType {
+    "key",
+    "delta",
+};
+</xmp>
+
+### Constructors ###{#encodedvideochunk-constructors}
+<dfn constructor for=EncodedVideoChunk title="EncodedVideoChunk(init)">
+  EncodedVideoChunk(init)
+</dfn>
+1. Let |chunk| be a new {{EncodedVideoChunk}} object, initialized as follows
+    1. Assign `init.type` to `chunk.type`.
+    2. Assign `init.timestamp` to `chunk.timestamp`.
+    3. If duration is present in init, assign `init.duration` to
+        `chunk.duration`. Otherwise, assign null to `chunk.duration`.
+2. Assign a copy of `init.data` to `chunk.data`.
+3. Return |chunk|.
+
+### Attributes ###{#encodedvideochunk-attributes}
+<dl>
+  <dt><dfn attribute for=EncodedVideoChunk>type</dfn></dt>
+  <dd>Describes whether the chunk is a key frame or not.</dd>
+
+  <dt><dfn attribute for=EncodedVideoChunk>timestamp</dfn></dt>
+  <dd>The presentation timestamp, given in microseconds.</dd>
+
+  <dt><dfn attribute for=EncodedVideoChunk>duration</dfn></dt>
+  <dd>The presentation duration, given in microseconds.</dd>
+
+  <dt><dfn attribute for=EncodedVideoChunk>data</dfn></dt>
+  <dd>A sequence of bytes containing encoded video data.</dd>
+</dl>
+
+
+Raw Media Interfaces (Frames){#raw-media-interfaces}
+====================================================
+These interfaces represent unencoded (raw) media.
+
+
+AudioFrame Interface {#audioframe-interface}
+---------------------------------------------
+
+<xmp class='idl'>
+[Exposed=(Window,DedicatedWorker)]
+interface AudioFrame {
+  constructor(AudioFrameInit init);
+  readonly attribute unsigned long long timestamp;
+  readonly attribute AudioBuffer? buffer;
+  undefined close();
+};
+
+dictionary AudioFrameInit {
+  required unsigned long long timestamp;
+  required AudioBuffer buffer;
+};
+</xmp>
+
+### Internal Slots ###{#audioframe-internal-slots}
+<dl>
+  <dt><dfn attribute for=AudioFrame>\[[detached]]</dfn></dt>
+  <dd>
+    Boolean indicating whether close() was invoked and underlying resources
+        have been released.
+  </dd>
+</dl>
+
+
+### Constructors ###{#audioframe-constructors}
+<dfn constructor for=AudioFrame title="AudioFrame(init)">
+  AudioFrame(init)
+</dfn>
+1. Let |frame| be a new {{AudioFrame}} object.
+2. Assign `init.timestamp` to `frame.timestamp`.
+3. Assign `init.buffer` to `frame.buffer`.
+4. Assign `false` to the {{AudioFrame/[[detached]]}} internal slot.
+5. Return |frame|.
+
+
+### Attributes ###{#audioframe-attributes}
+<dl>
+  <dt><dfn attribute for=AudioFrame>timestamp</dfn></dt>
+  <dd>The presentation timestamp, given in microseconds.</dd>
+
+  <dt><dfn attribute for=AudioFrame>buffer</dfn></dt>
+  <dd>The buffer containing decoded audio data.</dd>
+</dl>
+
+
+### Methods ###{#audioframe-methods}
+<dl>
+  <dt><dfn method for=AudioFrame>close()</dfn></dt>
+  <dd>
+    Immediately frees [=system resources=]. When invoked, run these steps:
+    1. Release [=system resources=] for buffer and set its value to null.
+    2. Assign `true` to the {{AudioFrame/[[detached]]}} internal slot.
+
+    NOTE: This section needs work. We should use the name and semantics of
+        VideoFrame destroy(). Similarly, we should add clone() to make a deep
+        copy.
+  </dd>
+</dl>
+
+VideoFrame Interface {#videoframe-interface}
+--------------------------------------------
+
+<xmp class='idl'>
+[Exposed=(Window,DedicatedWorker)]
+interface VideoFrame {
+  constructor(ImageBitmap imageBitmap, optional VideoFrameInit frameInit = {});
+  constructor(PixelFormat pixelFormat, sequence<(Plane or PlaneInit)> planes,
+              optional VideoFrameInit frameInit = {});
+
+  readonly attribute PixelFormat format;
+  readonly attribute FrozenArray<Plane> planes;
+  readonly attribute unsigned long codedWidth;
+  readonly attribute unsigned long codedHeight;
+  readonly attribute unsigned long cropLeft;
+  readonly attribute unsigned long cropTop;
+  readonly attribute unsigned long cropWidth;
+  readonly attribute unsigned long cropHeight;
+  readonly attribute unsigned long displayWidth;
+  readonly attribute unsigned long displayHeight;
+  readonly attribute unsigned long long? duration;
+  readonly attribute unsigned long long? timestamp;
+
+  undefined destroy();
+  VideoFrame clone();
+
+  Promise<ImageBitmap> createImageBitmap(
+    optional ImageBitmapOptions options = {});
+
+};
+
+dictionary VideoFrameInit {
+  unsigned long codedWidth;
+  unsigned long codedHeight;
+  unsigned long cropLeft;
+  unsigned long cropTop;
+  unsigned long cropWidth;
+  unsigned long cropHeight;
+  unsigned long displayWidth;
+  unsigned long displayHeight;
+  unsigned long long duration;
+  unsigned long long timestamp;
+};
+</xmp>
+
+### Internal Slots ###{#videoframe-internal-slots}
+
+: <dfn attribute for=VideoFrame>\[[detached]]</dfn>
+:: A boolean indicating whether {{destroy()}} was invoked and underlying
+    resources have been released.
+
+: <dfn attribute for=VideoFrame>\[[format]]</dfn>
+:: A {{PixelFormat}} describing the pixel format of the {{VideoFrame}}.
+
+: <dfn attribute for=VideoFrame>\[[planes]]</dfn>
+:: A list of {{Plane}}s describing the memory layout of the pixel data in
+    {{VideoFrame}}. The number of {{Plane}}s and their semantics are
+    determined by {{VideoFrame/[[format]]}}.
+
+: <dfn attribute for=VideoFrame>[[coded width]]</dfn>
+:: Width of the {{VideoFrame}} in pixels, prior to any cropping or aspect
+    ratio adjustments.
+
+: <dfn attribute for=VideoFrame>[[coded height]]</dfn>
+:: Height of the {{VideoFrame}} in pixels, prior to any cropping or aspect
+    ratio adjustments.
+
+: <dfn attribute for=VideoFrame>[[crop left]]</dfn>
+:: The number of pixels to remove from the left of the {{VideoFrame}},
+    prior to aspect ratio adjustments.
+
+: <dfn attribute for=VideoFrame>[[crop top]]</dfn>
+:: The number of pixels to remove from the top of the {{VideoFrame}},
+    prior to aspect ratio adjustments.
+
+: <dfn attribute for=VideoFrame>[[crop width]]</dfn>
+:: The width of pixels to include in the crop, starting from cropLeft.
+
+: <dfn attribute for=VideoFrame>[[crop height]]</dfn>
+:: The height of pixels to include in the crop, starting from cropLeft.
+
+: <dfn attribute for=VideoFrame>[[display width]]</dfn>
+:: Width of the {{VideoFrame}} when displayed after applying aspect ratio
+    adjustments.
+
+: <dfn attribute for=VideoFrame>[[display height]]</dfn>
+:: Height of the {{VideoFrame}} when displayed after applying aspect ratio
+    adjustments.
+
+: <dfn attribute for=VideoFrame>\[[duration]]</dfn>
+:: The presentation duration, given in microseconds. The duration is copied
+        from the {{EncodedVideoChunk}} corresponding to this {{VideoFrame}}.
+
+: <dfn attribute for=VideoFrame>\[[timestamp]]</dfn>
+::  The presentation timestamp, given in microseconds. The timestamp is copied
+    from the {{EncodedVideoChunk}} corresponding to this {{VideoFrame}}.
+
+### Constructors ###{#videoframe-constructors}
+
+NOTE: this section needs work. Current wording assumes a VideoFrame can always
+    be easily represented using one of the known pixel formats. In practice, the
+    underlying UA resources may be GPU backed or formatted in such a way that
+    conversion to an allowed pixel format requires expensive copies and
+    translation. When this occurs, we should allow planes to be null and format
+    to be "opaque" to avoid early optimization. We should make conversion
+    explicit and user controlled by offering a `videoFrame.convertTo(format)`
+    that returns a Promise containing a new VideoFrame for which the
+    copies/translations are performed.
+
+<dfn constructor for=VideoFrame title="VideoFrame(imageBitmap, frameInit)">
+  VideoFrame(imageBitmap, frameInit)
+</dfn>
+1. If |frameInit| is not a [=valid VideoFrameInit=], throw a {{TypeError}}.
+2. If the value of |imageBitmap|'s' {{PlatformObject/[[Detached]]}} internal
+    slot is set to `true`, then throw an {{InvalidStateError}} DOMException.
+3. Let |frame| be a new {{VideoFrame}}.
+4. Assign `false` to |frame|’s {{VideoFrame/[[detached]]}} internal slot.
+5. Use a copy of the pixel data in |imageBitmap| to initialize to following
+    |frame| internal slots:
+    1. Initialize {{VideoFrame/[[format]]}} be the underlying format of
+        imageBitmap.
+    2. Initialize {{VideoFrame/[[planes]]}} to describe the arrangement of
+        memory of the copied pixel data.
+    3. Assign regions of the copied pixel data to the
+        {{Plane/[[plane buffer]]}} internal slot of each plane as
+        appropriate for the pixel format.
+    4. Initialize {{VideoFrame/[[coded width]]}} and
+        {{VideoFrame/[[coded height]]}} to describe the width and height of
+        the imageBitamp prior to any cropping or aspect ratio adjustments.
+6. Use |frameInit| to initialize the remaining |frame| internal slots:
+    1. If `frameInit.cropLeft` is present, assign it to
+        {{VideoFrame/[[crop left]]}}. Otherwise, assign `0` to
+        {{VideoFrame/[[crop left]]}}.
+    2. If `frameInit.cropTop` is present, assign it to
+        {{VideoFrame/[[crop top]]}}. Otherwise, assign `0` to
+        {{VideoFrame/[[crop top]]}}
+    3. If `frameInit.cropWidth` is present, assign it to
+        {{VideoFrame/[[crop width]]}}. Otherwise, assign
+        {{VideoFrame/[[coded width]]}} to {{VideoFrame/[[crop width]]}}.
+    4. If `frameInit.cropHeight` is present, assign it to
+        {{VideoFrame/[[crop height]]}}. Otherwise, assign
+        {{VideoFrame/[[coded height]]}} to {{VideoFrame/[[crop height]]}}.
+    5. If `frameInit.displayWidth` is present, assign it to
+        {{VideoFrame/[[display width]]}}. Otherwise, assign
+        {{VideoFrame/[[crop width]]}} to {{VideoFrame/[[display width]]}}.
+    6. If `frameInit.displayHeight` is present, assign it to
+        {{VideoFrame/[[display height]]}}. Otherwise, assign
+        {{VideoFrame/[[crop height]]}} to {{VideoFrame/[[display height]]}}.
+    7. If `frameInit.duration` is present, assign it to
+        {{VideoFrame/[[duration]]}}. Otherwise, assign `null` to
+        {{VideoFrame/[[duration]]}}.
+    8. If `frameInit.timestamp` is present, assign it to
+        {{VideoFrame/[[timestamp]]}}. Otherwise, assign `null` to
+        {{VideoFrame/[[timestamp]]}}.
+7. Return |frame|.
+
+<dfn constructor for=VideoFrame title="VideoFrame(pixelFormat, planes, frameInit)">
+  VideoFrame(pixelFormat, planes, frameInit)
+</dfn>
+1. If either {{VideoFrameInit/codedWidth}} or {{VideoFrameInit/codedHeight}} is
+    not present in |frameInit|, throw a {{TypeError}}.
+2. If |frameInit| is not a [=valid VideoFrameInit=], throw a {{TypeError}}.
+3. If the length of |planes| is incompatible with the given pixelFormat, throw
+    a {{TypeError}}.
+4. Let |frame| be a new {{VideoFrame}} object.
+5. Assign `false` to |frame|’s {{VideoFrame/[[detached]]}} internal slot.
+6. Assign `init.format` to |frame|'s {{VideoFrame/[[format]]}}.
+7. For each element |p| in |planes|:
+    1. If |p| is a {{Plane}}, append a copy of p to |frame|'s
+        {{VideoFrame/[[planes]]}} and [=continue=].
+    2. If |p| is a {{PlaneInit}}, append a new {{Plane}} <var ignore>q</var> to
+        |frame|'s {{VideoFrame/[[planes]]}}, initialized as follows:
+        1. Assign a copy of `p.src` to q's {{Plane/[[plane buffer]]}} internal
+            slot.
+
+            NOTE: the samples should be copied exactly, but the user agent may
+                add row padding as needed to improve memory alignment.
+
+        2. Assign the width of each row in [[plane buffer]], including any
+            padding, to  `q.stride`.
+        3. Assign `p.rows` to `q.rows`.
+        4. Assign the product of (`q.rows` * `q.stride)` to `q.length`
+8. Assign `frameInit.codedWidth` to |frame|'s {{VideoFrame/[[coded width]]}}.
+9. Assign `frameInit.codedHeight` to |frame|'s {{VideoFrame/[[coded height]]}}.
+10. If `frameInit.cropLeft` is present, assign it |frame|'s
+    {{VideoFrame/[[crop left]]}}. Otherwise, assign `0` to
+    {{VideoFrame/[[crop left]]}}.
+11. If `frameInit.cropTop` is present, assign it to |frame|'s
+    {{VideoFrame/[[crop top]]}}. Otherwise, assign `0` to
+    {{VideoFrame/[[crop top]]}}.
+12. If `frameInit.cropWidth` is present, assign it to |frame|'s
+    {{VideoFrame/[[crop width]]}}. Otherwise, assign
+    {{VideoFrame/[[coded width]]}} to {{VideoFrame/[[crop width]]}}.
+13. If `frameInit.cropHeight` is present, assign it to |frame|'s
+    {{VideoFrame/[[crop height]]}}. Otherwise, assign
+    {{VideoFrame/[[coded height]]}} to {{VideoFrame/[[crop height]]}}.
+14. If `frameInit.displayWidth` is present, assign it to |frame|'s
+    {{VideoFrame/[[display width]]}}. Otherwise, assign
+    {{VideoFrame/[[crop width]]}} to {{VideoFrame/[[display width]]}}.
+15. If `frameInit.displayHeight` is present, assign it to |frame|'s
+    {{VideoFrame/[[display height]]}}. Otherwise, assign
+    {{VideoFrame/[[crop height]]}} to {{VideoFrame/[[display height]]}}.
+16. If `frameInit.duration` is present, assign it to
+    {{VideoFrame/[[duration]]}}. Otherwise, assign `null` to
+    {{VideoFrame/[[duration]]}}.
+17. If `frameInit.timestamp` is present, assign it to
+    {{VideoFrame/[[timestamp]]}}. Otherwise, assign `null` to
+    {{VideoFrame/[[timestamp]]}}.
+18. Return frame.
+
+### Attributes ###{#videoframe-attributes}
+: <dfn attribute for=VideoFrame>format</dfn>
+:: Describes the arrangement of bytes in each plane as well as the number and
+    order of the planes.
+
+    The {{VideoFrame/format}} getter steps are to return
+    {{VideoFrame/[[format]]}}.
+
+: <dfn attribute for=VideoFrame>planes</dfn>
+:: Holds pixel data data, laid out as described by format and Plane
+    attributes.
+
+    The {{VideoFrame/planes}} getter steps are to return
+    {{VideoFrame/[[planes]]}}.
+
+: <dfn attribute for=VideoFrame>codedWidth</dfn>
+:: Width of the {{VideoFrame}} in pixels, prior to any cropping or aspect ratio
+    adjustments.
+
+    The {{VideoFrame/codedWidth}} getter steps are to return
+    {{VideoFrame/[[coded width]]}}.
+
+: <dfn attribute for=VideoFrame>codedHeight</dfn>
+:: Height of the VideoFrame in pixels, prior to any cropping or aspect ratio
+    adjustments.
+
+    The {{VideoFrame/codedHeight}} getter steps are to return
+    {{VideoFrame/[[coded height]]}}.
+
+: <dfn attribute for=VideoFrame>cropLeft</dfn>
+:: The number of pixels to remove from the left of the VideoFrame, prior to
+    aspect ratio adjustments.
+
+    The {{VideoFrame/cropLeft}} getter steps are to return
+    {{VideoFrame/[[crop left]]}}.
+
+: <dfn attribute for=VideoFrame>cropTop</dfn>
+:: The number of pixels to remove from the top of the VideoFrame, prior to
+    aspect ratio adjustments.
+
+    The {{VideoFrame/cropTop}} getter steps are to return
+    {{VideoFrame/[[crop top]]}}.
+
+: <dfn attribute for=VideoFrame>cropWidth</dfn>
+:: The width of pixels to include in the crop, starting from cropLeft.
+
+    The {{VideoFrame/cropWidth}} getter steps are to return
+    {{VideoFrame/[[crop width]]}}.
+
+: <dfn attribute for=VideoFrame>cropHeight</dfn>
+:: The height of pixels to include in the crop, starting from cropLeft.
+
+    The {{VideoFrame/cropHeight}} getter steps are to return
+    {{VideoFrame/[[crop height]]}}.
+
+: <dfn attribute for=VideoFrame>displayWidth</dfn>
+:: Width of the VideoFrame when displayed after applying aspect ratio
+    adjustments.
+
+    The {{VideoFrame/displayWidth}} getter steps are to return
+    {{VideoFrame/[[display width]]}}.
+
+: <dfn attribute for=VideoFrame>displayHeight</dfn>
+:: Height of the VideoFrame when displayed after applying aspect ratio
+    adjustments.
+
+    The {{VideoFrame/displayHeight}} getter steps are to return
+    {{VideoFrame/[[display height]]}}.
+
+: <dfn attribute for=VideoFrame>timestamp</dfn>
+:: The presentation timestamp, given in microseconds. The timestamp is copied
+    from the {{EncodedVideoChunk}} corresponding to this VideoFrame.
+
+    The {{VideoFrame/timestamp}} getter steps are to return
+    {{VideoFrame/[[timestamp]]}}.
+
+: <dfn attribute for=VideoFrame>duration</dfn>
+:: The presentation duration, given in microseconds. The duration is copied
+    from the {{EncodedVideoChunk}} corresponding to this VideoFrame.
+
+    The {{VideoFrame/duration}} getter steps are to return
+    {{VideoFrame/[[duration]]}}.
+
+### Methods ###{#videoframe-methods}
+<dfn method for=VideoFrame>destroy()</dfn>
+Immediately frees [=system resources=]. Destruction applies to all
+    references, including references that are serialized and passed across
+    Realms.
+
+NOTE: Authors should take care to manage frame lifetimes by calling
+    {{VideoFrame/destroy()}} immediately when frames are no longer needed.
+
+NOTE: Use clone() to create a deep copy. Cloned frames have their own lifetime
+    and will not be affected by destroying the original frame.
+
+When invoked, run these steps:
+1. If {{VideoFrame/[[detached]]}} is `true`, throw an {{InvalidStateError}}.
+2. Remove all {{Plane}}s from {{VideoFrame/[[planes]]}} and release associated
+    memory.
+3. Assign `true` to the {{VideoFrame/[[detached]]}} internal slot.
+
+<dfn method for=VideoFrame>clone()</dfn>
+Creates a new {{VideoFrame}} with a separate lifetime containing a deep copy of
+    this frame’s resources.
+
+NOTE:  VideoFrames may require a large amount of memory. Use
+    {{VideoFrame/clone()}} sparingly.
+
+When invoked, run the following steps:
+1. If the value of the {{VideoFrame/[[detached]]}} slot is `true`, return
+    [=a promise rejected with=] {{InvalidStateError}} {{DOMException}}.
+2. Let |p| be a new Promise.
+3. In parallel, resolve |p| with the result of running the <a>Clone Frame</a>
+    algorithm with <a>this</a>.
+4. Return |p|.
+
+<dfn method for=VideoFrame>createImageBitmap(options)</dfn>
+Creates an ImageBitmap from this {{VideoFrame}}.
+
+When invoked, run these steps:
+1. Let |p| be a new Promise.
+2. If either |options|'s {{ImageBitmapOptions/resizeWidth}} or
+    {{ImageBitmap/resizeHeight}} is present and is 0, then return |p| rejected
+    with an {{InvalidStateError}} {{DOMException}}.
+3. If the <a>this'</a> {{VideoFrame/[[detached]]}} internal slot is set to
+    `true`, then return |p| rejected with an {{InvalidStateError}}
+    {{DOMException}}.
+4. Let |imageBitmap| be a new {{ImageBitmap}} object.
+5. Set |imageBitmap|'s bitmap data to a copy of the {{VideoFrame}} pixel data,
+    at the frame's intrinsic width and intrinsic height (`i.e`., after any
+    aspect-ratio correction has been applied), cropped to the source rectangle
+    with formatting.
+6. If the origin of |imageBitmap|'s image is not same origin with entry settings
+    object's origin, then set the origin-clean flag of |imageBitmap|'s bitmap to
+    `false`.
+7. Run this step in parallel:
+  1. Resolve p with imageBitmap.
+
+### Algorithms ###{#videoframe-algorithms}
+To check if a {{VideoFrameInit}} is a <dfn>valid VideoFrameInit</dfn>,
+run these steps:
+1. If {{VideoFrameInit/codedWidth}} = 0 or {{VideoFrameInit/codedHeight}} = 0,
+    return `false`.
+2. If {{VideoFrameInit/cropWidth}} = 0 or {{VideoFrameInit/cropHeight}} = 0,
+    return `false`.
+3. If {{VideoFrameInit/cropTop}} + {{VideoFrameInit/cropHeight}} >=
+    {{VideoFrameInit/codedHeight}}, return `false`.
+4. If {{VideoFrameInit/cropLeft}} + {{VideoFrameInit/cropWidth}} >=
+    {{VideoFrameInit/codedWidth}}, return `false`.
+5. If {{VideoFrameInit/displayWidth}} = 0 or
+    {{VideoFrameInit/displayHeight}} = 0, return `false`.
+6. Return `true`.
+
+
+Plane Interface {#plane-interface}
+----------------------------------
+A {{Plane}} acts like a thin wrapper around an {{ArrayBuffer}}, but may actually
+    be backed by a texture. {{Plane}}s hide any padding before the first sample
+    or after the last row.
+
+A {{Plane}} is solely constructed by its {{VideoFrame}}. During construction,
+    the User Agent may use knowledge of the frame’s {{PixelFormat}} to add
+    padding to the {{Plane}} to improve memory alignment.
+
+A {{Plane}} cannot be used after the {{VideoFrame}} is destroyed. A new
+    {{VideoFrame}} can be assembled from existing {{Plane}}s, and the new
+    {{VideoFrame}} will remain valid when the original is destroyed. This makes
+    it possible to efficiently add an alpha plane to an existing {{VideoFrame}}.
+
+
+<xmp class='idl'>
+[Exposed=(Window,DedicatedWorker)]
+interface Plane {
+  readonly attribute unsigned long stride;
+  readonly attribute unsigned long rows;
+  readonly attribute unsigned long length;
+
+  undefined readInto(ArrayBufferView dst);
+};
+
+dictionary PlaneInit {
+  required BufferSource src;
+  required unsigned long stride;
+  required unsigned long rows;
+};
+</xmp>
+
+### Internal Slots ###{#plane-internal-slots}
+<dl>
+  <dt><dfn attribute for=Plane>[[parent frame]]</dfn></dt>
+  <dd>Refers to the {{VideoFrame}} that constructed and owns this plane.</dd>
+  <dt><dfn attribute for=Plane>[[plane buffer]]</dfn></dt>
+  <dd>Internal storage for the plane’s pixel data.</dd>
+</dl>
+
+### Attributes ###{#plane-attributes}
+<dl>
+  <dt><dfn attribute for=Plane>stride</dfn></dt>
+  <dd>The width of each row including any padding.</dd>
+  <dt><dfn attribute for=Plane>rows</dfn></dt>
+  <dd>The number of rows.</dd>
+  <dt><dfn attribute for=Plane>length</dfn></dt>
+  <dd>The total byte length of the plane (stride * rows).</dd>
+</dl>
+
+### Methods ###{#plane-methods}
+<dfn method for=Plane>readInto(dst)</dfn>
+
+Copies the plane data into dst.
+
+When invoked, run these steps:
+1. If {{Plane/[[parent frame]]}} has been destroyed, throw an
+    {{InvalidStateError}}.
+2. If {{Plane/length}} is greater than |`dst.byteLength`|, throw a
+    {{TypeError}}.
+3. Copy the {{Plane/[[plane buffer]]}} into <var ignore>dst</var>.
+
+
+Pixel Format{#pixel-format}
+---------------------------
+Pixel formats describe the arrangement of bytes in each plane as well as the
+number and order of the planes.
+
+NOTE: This section needs work. We expect to add more pixel formats and offer
+    much more verbose definitions. For now, please see
+    <a href="http://www.fourcc.org/pixel-format/yuv-i420/">
+    http://www.fourcc.org/pixel-format/yuv-i420/</a> for a more complete
+    description.
+
+<xmp class='idl'>
+enum PixelFormat {
+  "I420"
+};
+</xmp>
+
+<dl>
+  <dt><dfn enum-value for=PixelFormat>I420</dfn></dt>
+  <dd>
+    Planar 4:2:0 YUV.
+  </dd>
+</dl>
+
+
+Algorithms{#raw-media-algorithms}
+---------------------------------
+<dl>
+  <dt><dfn>Clone Frame</dfn> (with |frame|)</dt>
+  <dd>
+    1. Let |cloneFrame| be a new object of the same type as frame (either
+        {{AudioFrame}} or {{VideoFrame}}).
+    2. Initialize each attribute and internal slot of clone with a copy of the
+        value from the corresponding attribute of this frame.
+
+        NOTE: User Agents are encouraged to avoid expensive copies of large
+            objects (for instance, {{VideoFrame}} pixel data). Frame types are
+            immutable, so the above step may be implemented using memory sharing
+            techniques such as reference counting.
+
+    3. Return |cloneFrame|.
+
+  </dd>
+</dl>
+
+
+
+Security Considerations{#security-considerations}
+=================================================
+
+The primary security impact is that features of this API make it easier for an
+attacker to exploit vulnerabilities in the underlying platform codecs.
+Additionally, new abilities to configure and control the codecs may allow for
+new exploits that rely on a specific configuration and/or sequence of control
+operations.
+
+Platform codecs are historically an internal detail of APIs like
+{{HTMLMediaElement}}, [[WebAudio]], and [[WebRTC]]. In this way, it has always
+been possible to attack the underlying codecs by using malformed media
+files/streams and invoking the various API control methods.
+
+For example, you can send any stream to a decoder by first wrapping that stream
+in a media container (e.g. mp4) and setting that as the {{HTMLMediaElement/src}}
+of an {{HTMLMediaElement}}. You can then cause the underlying video decoder to
+be {{VideoDecoder/reset()}} by setting a new value for `<video>.currentTime`.
+
+WebCodecs makes such attacks easier by exposing low level control when inputs
+are provided and direct access to invoke the codec control methods. This also
+affords attackers the ability to invoke sequences of control methods that were
+not previously possible via the higher level APIs.
+
+User agents should mitigate this risk by extensively fuzzing their
+implementation with random inputs and control method invocations. Additionally,
+user agents are encouraged to isolate their underlying codecs in processes with
+restricted privileges (sandbox) as a barrier against successful exploits being
+able to read user data.
+
+An additional concern is exposing the underlying codecs to input mutation race
+conditions. Specifically, it should not be possible for a site to mutate a codec
+input or output while the underlying codec may still be operating on that data.
+This concern is mitigated by ensuring that input and output interfaces are
+immutable.
+
+ISSUE: EncodedVideoChunk and EncodedAudioChunk currently expose a mutable
+data. See <a href="https://github.com/w3c/webcodecs/issues/80">#80</a>.
+
+Privacy Considerations{#privacy-considerations}
+===============================================
+The primary privacy impact is an increased ability to fingerprint users by
+querying for different codec capabilities to establish a codec feature profile.
+Much of this profile is already exposed by existing APIs. Such profiles are very
+unlikely to be uniquely identifying, but may be used with other metrics to
+create a fingerprint.
+
+An attacker may accumulate a codec feature profile by calling
+`IsConfigSupported()` methods with a number of different configuration
+dictionaries. Similarly, an attacker may attempt to `configure()` a codec with
+different configuration dictionaries and observe which configurations are
+accepted.
+
+Attackers may also use existing APIs to establish much of the codec feature
+profile. For example, the [[media-capabilities]] {{decodingInfo()}} API
+describes what types of decoders are supported and its {{powerEfficient}}
+attribute may signal when a decoder uses hardware acceleration. Similarly, the
+[[WebRTC]] {{RTCRtpSender/getCapabilities()}} API may be used to determine what
+types of encoders are supported and the {{RTCPeerConnection/getStats()}} API may
+be used to determine when an encoder uses hardware acceleration. WebCodecs will
+expose some additional information in the form of low level codec features.
+
+A codec feature profile alone is unlikely to be uniquely identifying. Underlying
+codecs are often implemented entirely in software (be it part of the user agent
+binary or part of the operating system), such that all users who run that
+software will have a common set capabilities. Additionally, underlying codecs
+are often implemented with hardware acceleration, but such hardware is mass
+produced and devices of a particular class and manufacture date (e.g. flagship
+phones manufactured in 2020) will often have common capabilities. There will be
+outliers (some users may run outdated versions of software codecs or use a rare
+mix of custom assembled hardware), but most of the time a given codec feature
+profile is shared by a large group of users.
+
+Segmenting groups of users by codec feature profile still amounts to a bit of
+entropy that can be combined with other metrics to uniquely identify a user.
+User agents may partially mitigate this by returning an error whenever a site
+attempts to exhaustively probe for codec capabilities. Additionally, user agents
+may implement a "privacy budget", which depletes as authors use WebCodecs and
+other identifying APIs. Upon exhaustion of the privacy budget, codec
+capabilities could be reduced to a common baseline or prompt for user approval.
